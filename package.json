@@ -11,10 +11,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.2",
     "@vercel/blob": "^2.3.3",
-    "framer-motion": "^12.38.0",
     "lucide-react": "^1.7.0",
     "modal": "^0.7.4",
     "next": "16.2.2",
