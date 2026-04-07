@@ -1,7 +1,7 @@
 # Video-to-Tactical Replay Pipeline Design
 
 **Date:** 2026-04-07
-**Status:** Approved (v2 — rewritten after audit)
+**Status:** Approved (v3 — audit gaps fixed)
 **Approach:** Full Auto-Calibration
 
 ## Context
@@ -38,7 +38,9 @@ After `handleUploadComplete`, the page switches directly to a "Processing" view 
 The Modal Python SDK is Python-only. Node.js cannot call `.spawn()` or read Volumes directly. The bridge is a **pair of FastAPI web endpoints deployed on Modal** that the Next.js API routes call via plain HTTP fetch.
 
 ```python
-# modal_app.py exposes two HTTP endpoints:
+# modal_app.py exposes three HTTP endpoints:
+
+progress_dict = modal.Dict.from_name("job-progress", create_if_missing=True)
 
 @web_app.post("/submit")
 async def submit(body: dict):
@@ -46,11 +48,22 @@ async def submit(body: dict):
     Returns {call_id} immediately."""
     fn = modal.Function.from_name("soccer-analysis", "process_video")
     call = fn.spawn(body["video_url"], body["field_template"])
-    return {"call_id": call.object_id}
+    call_id = call.object_id
+    # Initialize progress entry
+    progress_dict.put(call_id, {"status": "queued", "stage": "starting", "percent": 0})
+    return {"call_id": call_id}
+
+@web_app.get("/status/{call_id}")
+async def poll_status(call_id: str):
+    """Returns current progress from modal.Dict. Cheap — no GPU cost."""
+    state = progress_dict.get(call_id, default=None)
+    if state is None:
+        return JSONResponse({"status": "unknown"}, status_code=404)
+    return state
 
 @web_app.get("/result/{call_id}")
 async def poll_result(call_id: str):
-    """Returns 202 if still running, 200 with result if done, 500 if failed."""
+    """Returns 202 if still running, 200 with result if done."""
     function_call = modal.FunctionCall.from_id(call_id)
     try:
         result = function_call.get(timeout=0)
@@ -59,27 +72,99 @@ async def poll_result(call_id: str):
         return JSONResponse({"status": "processing"}, status_code=202)
 ```
 
+**Progress reporting via `modal.Dict`:** The processing function writes progress updates to a named `modal.Dict` as it moves through stages. The `/status/{call_id}` endpoint reads from this dict — it's a lightweight key-value lookup, not a GPU function call. Dict entries persist for 7 days.
+
+```python
+# Inside the process_video function:
+d = modal.Dict.from_name("job-progress", create_if_missing=True)
+
+d.put(call_id, {"status": "processing", "stage": "transcoding", "percent": 5})
+# ... transcode ...
+d.put(call_id, {"status": "processing", "stage": "camera_motion", "percent": 15})
+# ... ECC ...
+d.put(call_id, {"status": "processing", "stage": "field_calibration", "percent": 30})
+# ... PnLCalib ...
+d.put(call_id, {"status": "processing", "stage": "detection", "percent": 45})
+# ... YOLO ...
+d.put(call_id, {"status": "processing", "stage": "tracking", "percent": 70})
+# ... BoT-SORT ...
+d.put(call_id, {"status": "processing", "stage": "classification", "percent": 85})
+# ... K-Means ...
+d.put(call_id, {"status": "processing", "stage": "transform", "percent": 95})
+# ... coordinate transform ...
+d.put(call_id, {"status": "complete", "stage": "done", "percent": 100})
+```
+
 The Next.js API routes call these HTTP endpoints. No Python subprocess, no Volume reads from Node.js, no npm `modal` package needed.
 
-### Video Transfer
+**Polling flow from Next.js:**
+- `/api/process/status/[jobId]` → calls Modal `/status/{call_id}` → returns `{status, stage, percent}`
+- `/api/process/result/[jobId]` → calls Modal `/result/{call_id}` → returns full JSON when `status === "complete"`
+- Frontend polls `/api/process/status/` every 5s for the progress bar, then fetches `/api/process/result/` once complete
 
-The upload route already streams the video to disk at `uploads/{video_id}.mp4`. Rather than uploading the file a second time to a Modal Volume, the Modal function downloads the video from the Next.js server via a temporary presigned URL:
+### Video Storage: Vercel Blob (not local disk)
 
-1. Next.js POST `/api/process` generates a time-limited URL for `/api/videos/{video_id}` (valid 2 hours)
-2. Passes this URL to Modal's `/submit` endpoint
-3. Modal function downloads the video via HTTP at the start of processing
+**Problem with local disk:** The current upload route streams to `uploads/` on disk. This works in development but fails in production — Vercel Functions are ephemeral and have no persistent filesystem. A 4GB video stored to disk disappears when the function cold-starts.
 
-This avoids the Volume upload bottleneck entirely. The existing `/api/videos/[id]` route already supports range requests and streaming.
+**Solution:** Use `@vercel/blob` for video storage. Videos upload directly from the browser to Vercel Blob's CDN (client upload pattern), bypassing the 4.5MB serverless function body limit entirely.
 
-**Caveat:** This requires the Next.js server to be reachable from Modal's infrastructure. In development, use ngrok or similar. In production on Vercel, this works natively.
+```bash
+pnpm i @vercel/blob
+# Requires BLOB_READ_WRITE_TOKEN env var (auto-provisioned from Vercel dashboard)
+```
 
-### Why Not Modal Volumes for Video Transfer
+**Upload flow (client-side upload):**
 
-Modal Volumes would work but add complexity:
-- Need Python SDK locally to call `batch_upload`
-- Upload bandwidth limited by local uplink (3-15 min for a 4GB file)
-- Volume is only accessible from Modal containers — can't read status from Node.js
-- The download-from-server approach reuses existing infrastructure
+```typescript
+// Browser (client component)
+import { upload } from '@vercel/blob/client';
+
+const blob = await upload(file.name, file, {
+  access: 'public',                // Modal needs direct download access
+  handleUploadUrl: '/api/upload',   // token exchange route
+  onUploadProgress: ({ percentage }) => setProgress(percentage),
+});
+// blob.url = permanent CDN URL for the video
+// blob.downloadUrl = blob.url + '?download=1'
+```
+
+```typescript
+// /api/upload/route.ts — handles token exchange only, never touches file bytes
+import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
+
+export async function POST(request: Request) {
+  const body = (await request.json()) as HandleUploadBody;
+  const jsonResponse = await handleUpload({
+    body,
+    request,
+    onBeforeGenerateToken: async (pathname) => ({
+      allowedContentTypes: ['video/mp4', 'video/quicktime'],
+      addRandomSuffix: true,
+    }),
+    onUploadCompleted: async ({ blob }) => {
+      // Store blob.url associated with video_id
+    },
+  });
+  return Response.json(jsonResponse);
+}
+```
+
+**Video transfer to Modal:** The blob URL is public and directly downloadable. Modal's processing function simply `wget`s or `requests.get()`s the blob URL — no Volume needed, no presigned URL complexity, no local server reachability requirement.
+
+### Why Vercel Blob over other options
+
+| Option | Problem |
+|--------|---------|
+| Local disk (`uploads/`) | No persistent filesystem on Vercel |
+| Modal Volume | Requires Python SDK locally, can't read from Node.js |
+| S3 + presigned URLs | Extra infrastructure, credentials management |
+| Vercel Blob | Native integration, client upload bypasses function limits, public URL works for Modal download |
+
+**Result caching:** Processing results are also stored in Vercel Blob as `{video_id}_result.json` instead of local disk. The status endpoint checks for this file before polling Modal.
+
+### Development Mode
+
+In development (`pnpm dev`), Vercel Blob still works — it uses the same `BLOB_READ_WRITE_TOKEN` against the real Vercel Blob service. No local storage fallback needed.
 
 ## Modal Processing Pipeline
 
@@ -142,6 +227,25 @@ fps = cap.get(cv2.CAP_PROP_FPS)  # typically 30
 
 Frames stored as numpy arrays. For a 75-min match at 30fps = 135,000 frames. At 1080p that's ~370GB uncompressed — too large for memory. Process in a **streaming fashion**: read frame, process, discard. Never hold all frames in memory.
 
+### Pipeline Stage Ordering
+
+The stages are NOT fully sequential — some interleave to avoid multiple passes over the video:
+
+**Pass 1 (single video read, all frames):**
+- Read each frame from the transcoded video
+- Every frame: compute ECC camera motion (Stage 2) — requires consecutive frames
+- Every 30th frame: run PnLCalib calibration (Stage 3) — updates the anchor homography
+- Every 3rd frame: run YOLO detection (Stage 4) + feed to BoT-SORT tracker (Stage 5) + collect torso crop for team classification (Stage 6 sampling)
+- Accumulate: per-frame homography chain, detection results, track assignments, color samples
+
+**Pass 2 (post-processing, in memory):**
+- Run K-Means team classification on accumulated color samples (Stage 6 fitting)
+- Apply homography to all tracked foot positions → field coordinates (Stage 7)
+- Detect halftime via motion scores accumulated in Pass 1
+- Build output JSON
+
+This single-pass-plus-postprocessing approach reads the video exactly once (after the initial FFmpeg transcode) and keeps memory bounded to the current frame + accumulated lightweight data (bboxes, track IDs, homography matrices, color histograms).
+
 ### Stage 2: Camera Motion Estimation (ECC, not optical flow)
 
 **The previous spec incorrectly proposed `cv2.calcOpticalFlowFarneback()` for homography propagation.** Farneback produces dense per-pixel flow, not a geometric camera transform. For a PTZ camera, we need the global camera motion matrix.
@@ -170,22 +274,66 @@ def estimate_camera_motion(prev_gray: np.ndarray, curr_gray: np.ndarray) -> np.n
 
 ### Stage 3: Field Calibration (PnLCalib)
 
-Run PnLCalib field keypoint detection every 30th frame (~1/sec). PnLCalib detects field line intersections and fits them against a known field model to produce a homography.
+Run PnLCalib field keypoint detection every 30th frame (~1/sec). PnLCalib detects field line intersections and uses PnL (Points and Lines) optimization to recover camera parameters, from which we derive the homography.
+
+**PnLCalib is not on PyPI.** It's imported directly from the cloned repo via `PYTHONPATH=/opt/PnLCalib`. The two model files both export `get_cls_net` — alias on import to avoid collision.
 
 ```python
-# PnLCalib returns field keypoints as pixel coordinates
-# cv2.findHomography maps them to the 9v9 field template (55m x 36m)
-field_pts_pixel = pnlcalib_detect(frame)  # detected keypoints
-field_pts_meters = match_to_template(field_pts_pixel, "9v9")  # known positions
-H_field, mask = cv2.findHomography(field_pts_pixel, field_pts_meters, cv2.RANSAC, 5.0)
+import yaml
+import torch
+import numpy as np
+from PIL import Image
+import torchvision.transforms as T
+
+# Both model files export get_cls_net — alias the line model
+from model.cls_hrnet import get_cls_net            # keypoint model
+from model.cls_hrnet_l import get_cls_net as get_cls_net_l  # line model
+from utils.utils_calib import FramebyFrameCalib
+from utils.utils_heatmap import (
+    get_keypoints_from_heatmap_batch_maxpool,
+    get_keypoints_from_heatmap_batch_maxpool_l,
+    complete_keypoints,
+)
+
+# Load models (done once at container startup)
+device = "cuda:0"
+
+cfg = yaml.safe_load(open("/opt/PnLCalib/config/hrnetv2_w48.yaml", "r"))
+model_kp = get_cls_net(cfg)
+model_kp.load_state_dict(torch.load("/opt/PnLCalib/weights/SV_kp", map_location=device))
+model_kp.to(device).eval()
+
+cfg_l = yaml.safe_load(open("/opt/PnLCalib/config/hrnetv2_w48_l.yaml", "r"))
+model_lines = get_cls_net_l(cfg_l)
+model_lines.load_state_dict(torch.load("/opt/PnLCalib/weights/SV_lines", map_location=device))
+model_lines.to(device).eval()
+
+# Per-frame calibration
+def calibrate_frame(frame_bgr: np.ndarray) -> dict | None:
+    """Returns cam_params dict with projection matrix, or None if calibration fails."""
+    cam = FramebyFrameCalib(iwidth=frame_bgr.shape[1], iheight=frame_bgr.shape[0])
+
+    # inference() populates the FramebyFrameCalib object with detected keypoints/lines
+    # then heuristic_voting() solves for camera parameters
+    inference(cam, frame_bgr, model_kp, model_lines,
+              kp_threshold=0.1486, line_threshold=0.3886, pnl_refine=True)
+
+    result = cam.heuristic_voting(refine_lines=True)
+    if result is None or "cam_params" not in result:
+        return None
+    return result["cam_params"]
+    # cam_params contains: focal length, principal point, rotation matrix, camera position
+    # From these we construct the 3x3 homography mapping pixels → field meters
 ```
+
+**Deriving homography from cam_params:** PnLCalib outputs full camera intrinsics + extrinsics. The field-plane homography is: `H = K @ [r1 | r2 | t]` where K is the 3x3 intrinsic matrix, r1/r2 are the first two columns of the rotation matrix, and t is the translation vector. This maps field-plane coordinates (z=0) to pixel coordinates; invert it to get pixel → field meters.
 
 **When PnLCalib fails** (too few visible field lines, e.g., tight zoom on a player):
 - Use the ECC-accumulated homography from the last successful keyframe
 - Mark frames as `low_confidence` if the gap exceeds 300 frames (10 seconds)
 - Frontend renders low-confidence dots at 50% opacity
 
-**PnLCalib weights:** `SV_kp` (single-view keypoint model) and `SV_lines` (line detection model), both downloaded into the container image at build time.
+**PnLCalib weights:** `SV_kp` (single-view keypoint model) and `SV_lines` (line detection model), pre-downloaded into `/opt/PnLCalib/weights/` at container image build time. Requires Python to run from a CWD where `from model.cls_hrnet import ...` resolves — hence `PYTHONPATH=/opt/PnLCalib`.
 
 ### Stage 4: Player Detection (YOLOv11n)
 
@@ -234,10 +382,62 @@ tracks = tracker.update(detections_array, frame)
 
 **Player ID format:** `player_id = f"track_{int(track_id)}"`. This is stable within a single processing run. Track IDs are integers starting from 1, assigned by BoT-SORT.
 
-**Halftime handling:** The XBotGo camera may stop and restart at halftime, creating a timestamp gap in the video. Detect gaps > 60 seconds between consecutive frames. When a gap is detected:
-1. Reset the tracker state (new BoT-SORT instance)
-2. Offset second-half track IDs by `max_first_half_id + 100` to avoid collision
-3. Include a `period: 1 | 2` field in the output JSON
+**Halftime handling:** The XBotGo Falcon produces a continuous video file — there are no timestamp gaps. Halftime must be detected by content analysis.
+
+**Detection method:** Frame differencing with a sustained low-motion window. During halftime, the camera typically shows an empty pitch or static scene for 10-15 minutes. Compute the mean absolute difference between consecutive frames (at 1fps, downsampled to 320x180 for speed). Smooth with a 30-second rolling average. Find the longest continuous window where motion score < threshold (tuned to 3.0). If this window exceeds 5 minutes, it's halftime.
+
+```python
+def detect_halftime(cap: cv2.VideoCapture, fps: float) -> float | None:
+    """Returns halftime start timestamp in seconds, or None."""
+    motion_scores = []
+    prev_gray = None
+    frame_idx = 0
+    sample_interval = int(fps)  # check 1 frame per second
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % sample_interval != 0:
+            frame_idx += 1
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (320, 180))
+
+        if prev_gray is not None:
+            score = float(np.mean(cv2.absdiff(gray, prev_gray)))
+            motion_scores.append((frame_idx / fps, score))
+
+        prev_gray = gray
+        frame_idx += 1
+
+    # Find longest low-motion window > 5 minutes
+    THRESHOLD = 3.0
+    MIN_DURATION = 300  # 5 minutes in seconds
+    best_start, best_len = None, 0
+    run_start, run_len = None, 0
+
+    for timestamp, score in motion_scores:
+        if score < THRESHOLD:
+            if run_start is None:
+                run_start = timestamp
+            run_len = timestamp - run_start
+        else:
+            if run_len > best_len and run_len > MIN_DURATION:
+                best_start, best_len = run_start, run_len
+            run_start, run_len = None, 0
+
+    return best_start  # None if no halftime detected
+```
+
+When halftime is detected:
+1. Split processing into two periods at the halftime boundary
+2. Reset BoT-SORT tracker state for the second half (new instance)
+3. Offset second-half track IDs by `max_first_half_id + 100` to avoid collision
+4. Include `periods` array in output metadata: `[{start_time: 0, end_time: halftime_start}, {start_time: halftime_end, end_time: duration}]`
+
+If no halftime is detected (e.g., single-half recording or continuous play), the output has one period covering the entire video.
 
 ### Stage 6: Team Classification (K-Means)
 
@@ -477,13 +677,16 @@ For v1 this is sufficient. If JSON sizes become problematic (>50MB), switch to s
 # Server-only (NO NEXT_PUBLIC_ prefix — never exposed to browser)
 MODAL_ENDPOINT=https://your-workspace--soccer-analysis-fastapi-app.modal.run
 
+# Vercel Blob (auto-provisioned from Vercel dashboard)
+BLOB_READ_WRITE_TOKEN=vercel_blob_rw_...
+
 # The existing NEXT_PUBLIC_MODAL_ENDPOINT must be renamed to MODAL_ENDPOINT
 # and all references updated to server-side only
 ```
 
 ### Result Caching
 
-Results cached as `uploads/{video_id}.json`. The POST `/api/process` checks for this file first — if it exists, returns the cached result immediately without calling Modal.
+Results cached in Vercel Blob as `{video_id}_result.json`. The POST `/api/process` checks for this blob first — if it exists, returns the cached result immediately without calling Modal.
 
 ### Removed
 
@@ -515,7 +718,7 @@ Results cached as `uploads/{video_id}.json`. The POST `/api/process` checks for 
 - Corrupted file: FFmpeg fails during transcode; error surfaces to user.
 
 ### Browser
-- Navigate away during processing: polling stops via useEffect cleanup. Return to same video_id and processing resumes (job_id stored on server as `uploads/{video_id}.job`).
+- Navigate away during processing: polling stops via useEffect cleanup. Return to same video_id and processing resumes (job_id stored in Vercel Blob as `{video_id}.job`).
 - Large result JSON: ~65MB heap is fine for desktop; show a warning on mobile.
 
 ## Type Changes
@@ -586,7 +789,8 @@ export interface ProcessResponse {
 | GPU Compute | Modal.com A10G | ~$0.37/match, 20-25 min processing |
 | CV Glue | supervision 0.26.x | Detections container + video frame generator |
 | Frontend Animation | Canvas2D + rAF + lerp | Two-layer canvas, binary search interpolation |
-| Framework | Next.js 16 + React 19 | Existing stack, no new frontend deps |
+| File Storage | Vercel Blob | Client upload, public URLs for Modal download |
+| Framework | Next.js 16 + React 19 | Existing stack |
 | Transcoding | FFmpeg (apt-installed on Modal) | H.265→H.264 normalization |
 
 ## What Gets Removed
@@ -625,24 +829,67 @@ export interface ProcessResponse {
 - `src/lib/modal-client.ts` — HTTP calls to Modal FastAPI endpoints (submit + poll)
 - `src/components/video/VideoPlayer.tsx` — New props interface with shared videoRef
 - `src/types/index.ts` — Keep UploadResponse, deprecate old ProcessResponse
-- `package.json` — Remove framer-motion, @ffmpeg/ffmpeg, @ffmpeg/util, modal
-- `.env.example` — Rename NEXT_PUBLIC_MODAL_ENDPOINT to MODAL_ENDPOINT
+- `package.json` — Remove framer-motion, @ffmpeg/ffmpeg, @ffmpeg/util, modal. Add @vercel/blob
+- `.env.example` — Rename NEXT_PUBLIC_MODAL_ENDPOINT to MODAL_ENDPOINT. Add BLOB_READ_WRITE_TOKEN
 
 ## Testing Plan
 
 ### Frontend Tests (Vitest + jsdom)
-- `tests/replay/interpolation.test.ts` — Binary search edge cases (before first keyframe, after last, exact match, between frames), lerp correctness
-- `tests/replay/field-renderer.test.ts` — Canvas coordinate mapping, resize handling, scale factor computation
-- `tests/api/process.test.ts` — Updated: mock Modal HTTP calls, test async job flow, test caching behavior
-- `tests/modal-client.test.ts` — Updated: test submit/poll HTTP pattern
 
-### Modal Pipeline Tests (Python, run locally)
-- Test PnLCalib keypoint detection on sample frames
-- Test ECC homography estimation between consecutive frames
-- Test BoT-SORT tracking with known detections
-- Test team classification K-Means on synthetic color data
-- End-to-end: process a 30-second clip, verify output JSON schema
+**`tests/replay/interpolation.test.ts`:**
+- `binarySearch` returns 0 when `t < keyframes[0].time` (clamp to first)
+- `binarySearch` returns last index when `t > keyframes[last].time` (clamp to last)
+- `binarySearch` returns correct bracketing index for mid-values
+- `binarySearch` handles exact match on a keyframe time
+- `binarySearch` handles single-element keyframe array
+- `lerp(0, 10, 0.5)` returns 5
+- `lerp` with `alpha=0` returns start, `alpha=1` returns end
+
+**`tests/replay/field-renderer.test.ts`:**
+- Scale factors: `scaleX = canvasWidth / 55`, `scaleY = canvasHeight / 36`
+- After resize, scale factors update correctly
+- `devicePixelRatio` scaling: canvas pixel dimensions = CSS dimensions × DPR
+- Field meter coordinate (27.5, 18) maps to canvas center
+
+**`tests/api/process.test.ts`:**
+- POST `/api/process` with valid video_id calls Modal `/submit` and returns `{job_id}`
+- POST `/api/process` with cached result returns it without calling Modal
+- GET `/api/process/status/[jobId]` forwards Modal `/status` response
+- GET `/api/process/result/[jobId]` returns full JSON when Modal returns 200
+- GET `/api/process/result/[jobId]` returns 202 when Modal returns 202
+- Mock fetch to Modal endpoint; never call real Modal in tests
+
+**`tests/modal-client.test.ts`:**
+- `submitJob(videoUrl, fieldTemplate)` calls correct Modal endpoint with correct body
+- `pollStatus(callId)` returns parsed `JobStatus` object
+- `getResult(callId)` returns parsed `ProcessingResult` when complete
+- `getResult(callId)` returns null when job is still processing (202)
+- Handles Modal endpoint returning 500 gracefully
+
+### Modal Pipeline Tests (Python, run with `pytest`)
+
+**`tests/test_ecc.py`:**
+- ECC on two identical frames returns identity matrix
+- ECC on a synthetically translated frame returns correct translation
+- ECC returns identity (fallback) when given unrelated frames (convergence failure)
+
+**`tests/test_team_classification.py`:**
+- K-Means k=4 on synthetic HSV data with 4 distinct clusters assigns correctly
+- Majority vote assigns correct team to a track with 80% same-cluster crops
+- Green pixel masking removes grass-colored pixels from torso crop
+
+**`tests/test_halftime.py`:**
+- Motion score drops to ~0 during a synthetic static segment
+- `detect_halftime` returns correct timestamp for a video with 5+ min static window
+- `detect_halftime` returns None when no static window exceeds threshold
+
+**`tests/test_output_schema.py`:**
+- Output JSON matches `ProcessingResult` TypeScript interface
+- All player_ids follow `track_{N}` format
+- All coordinates clamped to field bounds (0-55, 0-36)
+- Keyframes are sorted by time within each track
+- Second-half track IDs don't collide with first-half IDs
 
 ### Removed Tests
-- `tests/calibration/` — if any exist, remove (calibration removed)
-- Update any test that imports from removed files
+- Any test importing from `src/lib/field/detection.ts`, `src/lib/field/homography.ts`, or `src/lib/video-processing/` — remove or rewrite
+- Any test for `CalibrationOverlay` — remove
