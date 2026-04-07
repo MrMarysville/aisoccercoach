@@ -2,7 +2,7 @@
 Soccer Video Analysis — Modal App
 
 FastAPI web endpoints for job submission + status polling.
-GPU function for video processing (mock in v1, real CV pipeline in v2).
+GPU function for 7-stage video processing pipeline.
 
 Deploy: modal deploy modal_app.py
 """
@@ -11,7 +11,6 @@ import modal
 import fastapi
 from fastapi.responses import JSONResponse
 import time
-import random
 
 app = modal.App("soccer-analysis")
 
@@ -126,87 +125,530 @@ def fastapi_app():
     scaledown_window=300,
 )
 def process_video(video_url: str, field_template: str) -> dict:
-    """Process a soccer match video and return tracking data.
+    """Process a soccer match video through a 7-stage CV pipeline.
 
-    Currently returns mock data for end-to-end testing.
-    Real 7-stage CV pipeline will replace this in Task 15.
+    Pipeline (single-pass + post-processing):
+        1. Download + transcode (FFmpeg H.265→H.264)
+        2. ECC camera motion estimation (every frame)
+        3. PnLCalib field calibration (every 30th frame)
+        4. YOLOv11n player detection (every 3rd frame, batch=8)
+        5. BoT-SORT tracking with CMC (every 3rd frame)
+        6. K-Means team classification (post-processing)
+        7. Homography coordinate transform (post-processing)
 
     Args:
         video_url: Public URL of the uploaded video (Vercel Blob)
-        field_template: Field size — always "9v9" for now
+        field_template: Field size — "9v9" (55m x 36m)
 
     Returns:
         ProcessingResult dict matching the TypeScript interface
     """
+    import subprocess
+    import os
+    import random
+    import requests
+    import cv2
+    import numpy as np
+    from pathlib import Path
+    from collections import defaultdict
+    from ultralytics import YOLO
+    from boxmot import BotSort
+    from sklearn.cluster import KMeans
+    import supervision as sv
+
+    start_time = time.time()
     call_id = modal.current_function_call_id()
     d = modal.Dict.from_name("job-progress", create_if_missing=True)
 
-    # Simulate processing stages with progress updates
-    stages = [
-        ("transcoding", 5),
-        ("camera_motion", 15),
-        ("field_calibration", 30),
-        ("detection", 45),
-        ("tracking", 70),
-        ("classification", 85),
-        ("transform", 95),
-    ]
+    # Field dimensions (meters)
+    FIELD_W = 55.0 if field_template == "9v9" else 105.0
+    FIELD_H = 36.0 if field_template == "9v9" else 68.0
+    FIELD_MARGIN = 3.0  # meters margin for containment check
+    DETECTION_INTERVAL = 3  # run YOLO every Nth frame
+    CALIBRATION_INTERVAL = 30  # run PnLCalib every Nth frame
+    ECC_DOWNSAMPLE = (640, 360)  # downsample for ECC speed
+    MAX_COLOR_SAMPLES = 500  # reservoir sampling cap
 
-    for stage_name, percent in stages:
-        d.put(call_id, {
-            "status": "processing",
-            "stage": stage_name,
-            "percent": percent,
-        })
-        time.sleep(2)  # Simulate work (~14s total)
+    def update_progress(stage: str, percent: int):
+        d.put(call_id, {"status": "processing", "stage": stage, "percent": percent})
 
-    # Generate mock player tracking data
-    # 18 players (9 home + 9 away), 10fps over 10 minutes
-    tracks = []
-    for i in range(18):
-        team = "home" if i < 9 else "away"
-        keyframes = []
+    # -----------------------------------------------------------------------
+    # Stage 1: Download + Transcode
+    # -----------------------------------------------------------------------
+    update_progress("transcoding", 2)
 
-        # Start position — spread across the field
-        base_x = random.uniform(5, 50)
-        base_y = random.uniform(5, 31)
+    input_path = "/tmp/input_video"
+    transcoded_path = "/tmp/transcoded.mp4"
 
-        for t in range(0, 600):  # 600 seconds = 10 minutes, 1 keyframe/sec
-            # Random walk around base position
-            x = max(0, min(55, base_x + random.gauss(0, 2)))
-            y = max(0, min(36, base_y + random.gauss(0, 1.5)))
-            base_x = x  # drift
-            base_y = y
+    # Download video from Vercel Blob
+    resp = requests.get(video_url, stream=True)
+    resp.raise_for_status()
+    with open(input_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+            f.write(chunk)
 
-            keyframes.append({
-                "time": float(t),
-                "x": round(x, 2),
-                "y": round(y, 2),
-                "confidence": round(random.uniform(0.7, 1.0), 3),
+    update_progress("transcoding", 5)
+
+    # Transcode to H.264 (XBotGo Falcon may export H.265)
+    subprocess.run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-an",  # strip audio
+        transcoded_path,
+    ], check=True, capture_output=True)
+
+    os.remove(input_path)
+
+    cap = cv2.VideoCapture(transcoded_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total_frames / fps
+
+    update_progress("transcoding", 8)
+
+    # -----------------------------------------------------------------------
+    # Initialize models
+    # -----------------------------------------------------------------------
+    yolo_model = YOLO("yolo11n.pt")
+    yolo_model.to("cuda")
+
+    tracker = BotSort(
+        reid_weights=Path("osnet_x0_25_msmt17.pt"),
+        device=0,
+        half=True,
+        cmc_method="ecc",
+    )
+
+    # Try to load PnLCalib models (may fail if repo structure differs)
+    pnlcalib_available = False
+    try:
+        import yaml as pyyaml
+        import torch
+        from model.cls_hrnet import get_cls_net
+        from model.cls_hrnet_l import get_cls_net as get_cls_net_l
+        from utils.utils_calib import FramebyFrameCalib
+        from inference import inference as pnl_inference
+
+        cfg = pyyaml.safe_load(open("/opt/PnLCalib/config/hrnetv2_w48.yaml"))
+        kp_model = get_cls_net(cfg)
+        kp_model.load_state_dict(torch.load("/opt/PnLCalib/weights/SV_kp", map_location="cuda:0"))
+        kp_model.to("cuda:0").eval()
+
+        cfg_l = pyyaml.safe_load(open("/opt/PnLCalib/config/hrnetv2_w48_l.yaml"))
+        line_model = get_cls_net_l(cfg_l)
+        line_model.load_state_dict(torch.load("/opt/PnLCalib/weights/SV_lines", map_location="cuda:0"))
+        line_model.to("cuda:0").eval()
+
+        pnlcalib_available = True
+    except Exception as e:
+        print(f"[WARN] PnLCalib not available, using ECC-only calibration: {e}")
+
+    update_progress("camera_motion", 10)
+
+    # -----------------------------------------------------------------------
+    # Stage 2-5: Single-pass processing
+    # -----------------------------------------------------------------------
+    # Accumulators
+    prev_gray = None
+    H_accumulated = np.eye(3, dtype=np.float32)  # chains ECC per-frame
+    H_anchor = None  # last successful PnLCalib homography (pixel → field)
+    H_anchor_frame = -1
+    last_good_H = None  # the current best pixel→field homography
+
+    # Per-frame data: { frame_idx: { track_id: (foot_x_px, foot_y_px, conf) } }
+    frame_tracks = defaultdict(dict)
+    frame_H = {}  # { frame_idx: 3x3 homography matrix }
+    frame_confidence = {}  # { frame_idx: bool (True = high confidence H) }
+
+    # Color samples for team classification: { track_id: [hsv_histograms] }
+    color_samples = defaultdict(list)
+
+    # Motion scores for halftime detection
+    motion_scores = []
+
+    detection_batch = []  # accumulate frames for YOLO batch inference
+    detection_batch_indices = []
+
+    frame_idx = 0
+    processed_detection_frames = 0
+
+    def estimate_ecc(prev_g, curr_g):
+        """ECC camera motion: returns 3x3 homography."""
+        warp = np.eye(3, 3, dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+        try:
+            _, warp = cv2.findTransformECC(
+                prev_g.astype(np.float32),
+                curr_g.astype(np.float32),
+                warp, cv2.MOTION_HOMOGRAPHY, criteria,
+            )
+        except cv2.error:
+            pass  # convergence failure → identity
+        return warp
+
+    def calibrate_pnlcalib(frame_bgr):
+        """Run PnLCalib. Returns 3x3 pixel→field homography or None."""
+        if not pnlcalib_available:
+            return None
+        try:
+            cam = FramebyFrameCalib(iwidth=frame_bgr.shape[1], iheight=frame_bgr.shape[0])
+            pnl_inference(cam, frame_bgr, kp_model, line_model,
+                          kp_threshold=0.1486, line_threshold=0.3886, pnl_refine=True)
+            result = cam.heuristic_voting(refine_lines=True)
+            if result is None or "cam_params" not in result:
+                return None
+            # Derive homography from camera parameters
+            cp = result["cam_params"]
+            # PnLCalib gives K (intrinsic) and R, t (extrinsic)
+            # H_field = K @ [r1 | r2 | t] maps field (z=0) → pixel
+            # We invert to get pixel → field
+            K = np.array(cp.get("K", np.eye(3)), dtype=np.float32).reshape(3, 3)
+            R = np.array(cp.get("rotation", np.eye(3)), dtype=np.float32).reshape(3, 3)
+            t = np.array(cp.get("position", [0, 0, 0]), dtype=np.float32).reshape(3, 1)
+            H_field2pixel = K @ np.hstack([R[:, :2], t])
+            H_pixel2field = np.linalg.inv(H_field2pixel)
+            return H_pixel2field.astype(np.float32)
+        except Exception as e:
+            print(f"[WARN] PnLCalib failed on frame: {e}")
+            return None
+
+    def extract_torso_hsv(frame_bgr, bbox):
+        """Extract HSV histogram from upper half of bbox, masking green."""
+        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame_bgr.shape[1], x2)
+        y2 = min(frame_bgr.shape[0], y2)
+        torso = frame_bgr[y1:y1 + (y2 - y1) // 2, x1:x2]
+        if torso.size == 0:
+            return None
+        hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+        # Mask out green pixels (grass)
+        mask = ~((hsv[:, :, 0] > 25) & (hsv[:, :, 0] < 85) &
+                 (hsv[:, :, 1] > 40) & (hsv[:, :, 2] > 40))
+        pixels = hsv[mask]
+        if len(pixels) < 10:
+            return None
+        hist = cv2.calcHist([pixels], [0, 1], None, [18, 8], [0, 180, 0, 256])
+        return hist.flatten() / (hist.sum() + 1e-8)
+
+    def point_in_field(x_m, y_m):
+        """Check if a field-coordinate point is within bounds + margin."""
+        return (-FIELD_MARGIN <= x_m <= FIELD_W + FIELD_MARGIN and
+                -FIELD_MARGIN <= y_m <= FIELD_H + FIELD_MARGIN)
+
+    def apply_homography(H, px, py):
+        """Apply 3x3 homography to a pixel point, return field coords."""
+        pt = np.array([px, py, 1.0], dtype=np.float32)
+        result = H @ pt
+        if abs(result[2]) < 1e-10:
+            return None, None
+        return float(result[0] / result[2]), float(result[1] / result[2])
+
+    # Process each frame
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Downsample for ECC
+        gray_small = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_small = cv2.resize(gray_small, ECC_DOWNSAMPLE)
+
+        # --- ECC camera motion (every frame) ---
+        if prev_gray is not None:
+            H_frame = estimate_ecc(prev_gray, gray_small)
+            H_accumulated = H_frame @ H_accumulated
+
+            # Motion score for halftime detection (1fps sampling)
+            if frame_idx % int(fps) == 0:
+                score = float(np.mean(cv2.absdiff(gray_small, prev_gray)))
+                motion_scores.append((frame_idx / fps, score))
+
+        prev_gray = gray_small
+
+        # --- PnLCalib calibration (every 30th frame) ---
+        if frame_idx % CALIBRATION_INTERVAL == 0:
+            H_calib = calibrate_pnlcalib(frame)
+            if H_calib is not None:
+                H_anchor = H_calib
+                H_anchor_frame = frame_idx
+                H_accumulated = np.eye(3, dtype=np.float32)  # reset accumulation
+                last_good_H = H_anchor
+                frame_confidence[frame_idx] = True
+            else:
+                frame_confidence[frame_idx] = False
+
+        # Compute current frame's pixel→field homography
+        if H_anchor is not None:
+            # H_pixel2field = H_anchor @ inv(H_accumulated)
+            # Because H_accumulated maps anchor→current in pixel space
+            try:
+                current_H = H_anchor @ np.linalg.inv(H_accumulated)
+                last_good_H = current_H
+                gap = frame_idx - H_anchor_frame
+                frame_confidence[frame_idx] = gap < 300  # < 10 seconds
+            except np.linalg.LinAlgError:
+                current_H = last_good_H
+                frame_confidence[frame_idx] = False
+        else:
+            current_H = last_good_H
+            frame_confidence[frame_idx] = False
+
+        if current_H is not None:
+            frame_H[frame_idx] = current_H.copy()
+
+        # --- YOLO detection + tracking (every 3rd frame) ---
+        if frame_idx % DETECTION_INTERVAL == 0:
+            detection_batch.append(frame)
+            detection_batch_indices.append(frame_idx)
+
+            # Process in batches of 8
+            if len(detection_batch) >= 8:
+                results = yolo_model(detection_batch, classes=[0], conf=0.25, verbose=False)
+                for batch_i, result in enumerate(results):
+                    fidx = detection_batch_indices[batch_i]
+                    detections = sv.Detections.from_ultralytics(result)
+
+                    # Filter by bbox size and aspect ratio
+                    if len(detections) > 0:
+                        heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
+                        widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
+                        ratios = heights / (widths + 1e-6)
+                        size_mask = (heights > 30) & (heights < 500) & (ratios > 1.2) & (ratios < 4.0)
+                        detections = detections[size_mask]
+
+                    if len(detections) > 0:
+                        # Format for BoT-SORT: [x1, y1, x2, y2, conf, class_id]
+                        det_array = np.column_stack([
+                            detections.xyxy,
+                            detections.confidence,
+                            np.zeros(len(detections)),  # class_id = 0 (person)
+                        ]).astype(np.float32)
+
+                        tracks_output = tracker.update(det_array, detection_batch[batch_i])
+
+                        for track in tracks_output:
+                            x1, y1, x2, y2, track_id, conf = track[0], track[1], track[2], track[3], int(track[4]), float(track[5])
+                            foot_x = (x1 + x2) / 2
+                            foot_y = y2  # bottom of bbox
+
+                            frame_tracks[fidx][track_id] = (foot_x, foot_y, conf)
+
+                            # Collect color sample (reservoir sampling)
+                            if len(color_samples[track_id]) < MAX_COLOR_SAMPLES:
+                                hist = extract_torso_hsv(detection_batch[batch_i], (x1, y1, x2, y2))
+                                if hist is not None:
+                                    color_samples[track_id].append(hist)
+                            else:
+                                # Reservoir: replace with decreasing probability
+                                j = random.randint(0, frame_idx)
+                                if j < MAX_COLOR_SAMPLES:
+                                    hist = extract_torso_hsv(detection_batch[batch_i], (x1, y1, x2, y2))
+                                    if hist is not None:
+                                        color_samples[track_id][j] = hist
+                    else:
+                        # No detections — still update tracker with empty
+                        tracker.update(np.empty((0, 6), dtype=np.float32), detection_batch[batch_i])
+
+                detection_batch = []
+                detection_batch_indices = []
+
+        # Progress update every 5%
+        if frame_idx % max(1, total_frames // 20) == 0:
+            pct = 10 + int(60 * frame_idx / total_frames)  # 10-70%
+            update_progress("detection", min(pct, 70))
+
+        frame_idx += 1
+
+    # Flush remaining detection batch
+    if detection_batch:
+        results = yolo_model(detection_batch, classes=[0], conf=0.25, verbose=False)
+        for batch_i, result in enumerate(results):
+            fidx = detection_batch_indices[batch_i]
+            detections = sv.Detections.from_ultralytics(result)
+            if len(detections) > 0:
+                heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
+                widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
+                ratios = heights / (widths + 1e-6)
+                size_mask = (heights > 30) & (heights < 500) & (ratios > 1.2) & (ratios < 4.0)
+                detections = detections[size_mask]
+            if len(detections) > 0:
+                det_array = np.column_stack([
+                    detections.xyxy,
+                    detections.confidence,
+                    np.zeros(len(detections)),
+                ]).astype(np.float32)
+                tracks_output = tracker.update(det_array, detection_batch[batch_i])
+                for track in tracks_output:
+                    x1, y1, x2, y2, track_id, conf = track[0], track[1], track[2], track[3], int(track[4]), float(track[5])
+                    frame_tracks[fidx][track_id] = ((x1 + x2) / 2, y2, conf)
+
+    cap.release()
+    os.remove(transcoded_path)
+
+    update_progress("classification", 75)
+
+    # -----------------------------------------------------------------------
+    # Stage 6: Team Classification (K-Means, post-processing)
+    # -----------------------------------------------------------------------
+    all_track_ids = set()
+    for ft in frame_tracks.values():
+        all_track_ids.update(ft.keys())
+
+    track_team = {}  # track_id → team label
+
+    if color_samples:
+        # Build feature matrix: average histogram per track
+        track_ids_with_color = []
+        features = []
+        for tid in sorted(all_track_ids):
+            samples = color_samples.get(tid, [])
+            if len(samples) >= 3:
+                avg_hist = np.mean(samples, axis=0)
+                features.append(avg_hist)
+                track_ids_with_color.append(tid)
+
+        if len(features) >= 4:
+            X = np.array(features)
+            kmeans = KMeans(n_clusters=min(4, len(features)), n_init=10, random_state=42)
+            labels = kmeans.fit_predict(X)
+
+            # Count tracks per cluster
+            cluster_counts = defaultdict(int)
+            for label in labels:
+                cluster_counts[int(label)] += 1
+
+            # Sort clusters by size: two largest = home/away, smallest = referee
+            sorted_clusters = sorted(cluster_counts.items(), key=lambda x: x[1], reverse=True)
+            cluster_to_team = {}
+            if len(sorted_clusters) >= 2:
+                cluster_to_team[sorted_clusters[0][0]] = "home"
+                cluster_to_team[sorted_clusters[1][0]] = "away"
+            if len(sorted_clusters) >= 3:
+                cluster_to_team[sorted_clusters[-1][0]] = "referee"
+
+            # Assign majority vote per track
+            track_labels = defaultdict(list)
+            for i, tid in enumerate(track_ids_with_color):
+                track_labels[tid].append(int(labels[i]))
+
+            for tid, lbl_list in track_labels.items():
+                majority = max(set(lbl_list), key=lbl_list.count)
+                track_team[tid] = cluster_to_team.get(majority, "unknown")
+
+    # Default: unknown for tracks without enough color data
+    for tid in all_track_ids:
+        if tid not in track_team:
+            track_team[tid] = "unknown"
+
+    update_progress("transform", 85)
+
+    # -----------------------------------------------------------------------
+    # Stage 7: Coordinate Transform (post-processing)
+    # -----------------------------------------------------------------------
+    # Build output tracks: { track_id: [keyframes] }
+    output_tracks = defaultdict(list)
+
+    for fidx in sorted(frame_tracks.keys()):
+        t_sec = fidx / fps
+        H = frame_H.get(fidx)
+        is_confident = frame_confidence.get(fidx, False)
+
+        for track_id, (foot_x, foot_y, conf) in frame_tracks[fidx].items():
+            if H is not None:
+                field_x, field_y = apply_homography(H, foot_x, foot_y)
+                if field_x is None:
+                    continue
+                # Clamp to field bounds
+                field_x = max(0, min(FIELD_W, field_x))
+                field_y = max(0, min(FIELD_H, field_y))
+                # Primary filter: must be within field + margin
+                if not point_in_field(field_x, field_y):
+                    continue
+                effective_conf = conf if is_confident else conf * 0.5
+            else:
+                # No homography — use normalized pixel position as rough estimate
+                field_x = (foot_x / width) * FIELD_W
+                field_y = (foot_y / height) * FIELD_H
+                effective_conf = conf * 0.3
+
+            output_tracks[track_id].append({
+                "time": round(t_sec, 3),
+                "x": round(float(field_x), 2),
+                "y": round(float(field_y), 2),
+                "confidence": round(float(effective_conf), 3),
             })
 
-        tracks.append({
-            "player_id": f"track_{i + 1}",
-            "team": team,
+    update_progress("transform", 92)
+
+    # -----------------------------------------------------------------------
+    # Halftime Detection (post-processing)
+    # -----------------------------------------------------------------------
+    HALFTIME_THRESHOLD = 3.0
+    HALFTIME_MIN_DURATION = 300  # 5 minutes
+    halftime_start = None
+    best_start, best_len = None, 0
+    run_start, run_len = None, 0
+
+    for timestamp, score in motion_scores:
+        if score < HALFTIME_THRESHOLD:
+            if run_start is None:
+                run_start = timestamp
+            run_len = timestamp - run_start
+        else:
+            if run_len > best_len and run_len > HALFTIME_MIN_DURATION:
+                best_start, best_len = run_start, run_len
+            run_start, run_len = None, 0
+
+    # Check final run
+    if run_len > best_len and run_len > HALFTIME_MIN_DURATION:
+        best_start = run_start
+
+    halftime_start = best_start
+
+    # Build periods
+    if halftime_start is not None:
+        halftime_end = halftime_start + best_len
+        periods = [
+            {"start_time": 0, "end_time": round(halftime_start, 1)},
+            {"start_time": round(halftime_end, 1), "end_time": round(duration, 1)},
+        ]
+    else:
+        periods = [{"start_time": 0, "end_time": round(duration, 1)}]
+
+    update_progress("transform", 98)
+
+    # -----------------------------------------------------------------------
+    # Build output
+    # -----------------------------------------------------------------------
+    tracks_list = []
+    for track_id in sorted(output_tracks.keys()):
+        keyframes = output_tracks[track_id]
+        if len(keyframes) < 3:
+            continue  # skip very short tracks (noise)
+        tracks_list.append({
+            "player_id": f"track_{track_id}",
+            "team": track_team.get(track_id, "unknown"),
             "keyframes": keyframes,
         })
 
-    d.put(call_id, {
-        "status": "complete",
-        "stage": "done",
-        "percent": 100,
-    })
+    processing_time = time.time() - start_time
+
+    d.put(call_id, {"status": "complete", "stage": "done", "percent": 100})
 
     return {
         "metadata": {
-            "video_id": "mock",
-            "fps": 30,
-            "detection_fps": 10,
-            "duration": 600.0,
-            "frame_count": 18000,
+            "video_id": video_url.split("/")[-1].replace(".mp4", "").replace(".mov", ""),
+            "fps": round(fps, 2),
+            "detection_fps": round(fps / DETECTION_INTERVAL, 2),
+            "duration": round(duration, 2),
+            "frame_count": total_frames,
             "field_template": field_template,
-            "periods": [{"start_time": 0, "end_time": 600}],
-            "processing_time_seconds": 14.0,
+            "periods": periods,
+            "processing_time_seconds": round(processing_time, 1),
         },
-        "tracks": tracks,
+        "tracks": tracks_list,
     }
