@@ -75,10 +75,10 @@ async def submit(body: dict):
         return JSONResponse({"error": "video_url is required"}, status_code=400)
 
     fn = modal.Function.from_name("soccer-analysis", "process_video")
-    call = fn.spawn(video_url, field_template)
+    call = await fn.spawn.aio(video_url, field_template)
     call_id = call.object_id
 
-    progress_dict.put(call_id, {
+    await progress_dict.put.aio(call_id, {
         "status": "processing",
         "stage": "starting",
         "percent": 0,
@@ -90,7 +90,7 @@ async def submit(body: dict):
 @web_app.get("/status/{call_id}")
 async def poll_status(call_id: str):
     """Return current progress from modal.Dict. Cheap — no GPU cost."""
-    state = progress_dict.get(call_id, default=None)
+    state = await progress_dict.get.aio(call_id, default=None)
     if state is None:
         return JSONResponse({"status": "unknown"}, status_code=404)
     return state
@@ -99,15 +99,21 @@ async def poll_status(call_id: str):
 @web_app.get("/result/{call_id}")
 async def poll_result(call_id: str):
     """Return 202 if still running, 200 with result if done."""
-    function_call = modal.FunctionCall.from_id(call_id)
     try:
-        result = function_call.get(timeout=0)
+        function_call = modal.functions.FunctionCall.from_id(call_id)
+        result = await function_call.get.aio(timeout=0)
         return result
     except TimeoutError:
         return JSONResponse({"status": "processing"}, status_code=202)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.function()
+web_image = modal.Image.debian_slim(python_version="3.11").pip_install("fastapi[standard]")
+
+
+@app.function(image=web_image)
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def fastapi_app():
     return web_app
