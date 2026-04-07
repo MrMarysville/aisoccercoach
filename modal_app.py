@@ -1,468 +1,212 @@
+"""
+Soccer Video Analysis — Modal App
+
+FastAPI web endpoints for job submission + status polling.
+GPU function for video processing (mock in v1, real CV pipeline in v2).
+
+Deploy: modal deploy modal_app.py
+"""
+
 import modal
-import cv2
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
-import math
+import fastapi
+from fastapi.responses import JSONResponse
+import time
+import random
 
-app = modal.App("soccer-video-processor")
+app = modal.App("soccer-analysis")
 
-image = modal.Image.debian_slim().pip_install(
-    "ultralytics==8.0.196",
-    "opencv-python-headless==4.10.0.84", 
-    "numpy==1.26.4",
-    "fastapi[standard]"
-).pip_install("torch", "torchvision", extra_index_url="https://download.pytorch.org/whl/cu121")
+# ---------------------------------------------------------------------------
+# Container image with all CV dependencies
+# ---------------------------------------------------------------------------
 
-yolo_model = None
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(["git", "libgl1", "libglib2.0-0", "ffmpeg", "wget"])
+    .pip_install([
+        "torch==2.3.1",
+        "torchvision==0.18.1",
+        "ultralytics",
+        "boxmot",
+        "opencv-python-headless==4.10.0.84",
+        "scikit-learn",
+        "supervision>=0.26.0",
+        "scipy==1.13.1",
+        "shapely==2.0.7",
+        "munkres==1.1.4",
+        "lsq-ellipse==2.2.1",
+        "coloredlogs==15.0.1",
+        "PyYAML==6.0.2",
+        "tqdm",
+        "requests",
+    ])
+    .run_commands([
+        # PnLCalib (not on PyPI — must clone)
+        "git clone https://github.com/mguti97/PnLCalib.git /opt/PnLCalib",
+        "mkdir -p /opt/PnLCalib/weights",
+        "wget -q https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_kp -O /opt/PnLCalib/weights/SV_kp",
+        "wget -q https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_lines -O /opt/PnLCalib/weights/SV_lines",
+        # Pre-download YOLO weights
+        'python -c "from ultralytics import YOLO; YOLO(\'yolo11n.pt\')"',
+        # Pre-download ReID weights for BoxMOT
+        'python -c "from boxmot import BotSort; from pathlib import Path; BotSort(reid_weights=Path(\'osnet_x0_25_msmt17.pt\'), device=\'cpu\', half=False)"',
+    ])
+    .env({"PYTHONPATH": "/opt/PnLCalib"})
+)
 
-def _get_yolo_model():
-    global yolo_model
-    if yolo_model is None:
-        from ultralytics import YOLO
-        yolo_model = YOLO("yolo26n.pt")
-    return yolo_model
+# ---------------------------------------------------------------------------
+# Shared progress dict (accessible from both web endpoints and GPU function)
+# ---------------------------------------------------------------------------
 
+progress_dict = modal.Dict.from_name("job-progress", create_if_missing=True)
 
-@app.function(image=image, gpu="H100")
-def process_video(
-    video_bytes: bytes,
-    calibration_points: Optional[List[Dict[str, float]]] = None,
-    field_template: str = "11v11",
-    frame_interval: int = 30,
-    auto_calibrate: bool = True
-) -> Dict[str, Any]:
-    """Process video using vanishing point + field geometry for PTZ cameras."""
-    global yolo_model
-    
-    nparr = np.frombuffer(video_bytes, np.uint8)
-    temp_path = "/tmp/temp_video.mp4"
-    with open(temp_path, "wb") as f:
-        f.write(nparr)
-    
-    cap = cv2.VideoCapture(temp_path)
-    if not cap.isOpened():
-        return {"error": "Failed to open video", "success": False}
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps if fps > 0 else 0
-    
-    field_dims = {"9v9": (55, 36), "11v11": (105, 68)}
-    field_w, field_h = field_dims.get(field_template, (105, 68))
-    
-    homography = None
-    initial_calibration = None
-    
-    if auto_calibrate:
-        ret, first_frame = cap.read()
-        if ret:
-            initial_calibration = _detect_field_geometry(first_frame, field_w, field_h)
-            if initial_calibration and len(initial_calibration) >= 4:
-                homography = _compute_homography_from_points(initial_calibration, field_w, field_h)
-                print(f"Auto-calibrated with {len(initial_calibration)} points using field geometry")
-    
-    if homography is None and calibration_points and len(calibration_points) >= 4:
-        homography = _compute_homography(calibration_points, field_template)
-    
-    if homography is None:
-        cap.release()
-        return {"error": "Could not compute homography - need at least 4 points", "success": False}
-    
-    yolo = _get_yolo_model()
-    
-    players = []
-    frame_idx = 0
-    processed_count = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        if frame_idx % frame_interval == 0:
-            frame_homography = homography
-            
-            if auto_calibrate and frame_idx > 0:
-                frame_calibration = _detect_field_geometry(frame, field_w, field_h)
-                if frame_calibration and len(frame_calibration) >= 4:
-                    try:
-                        frame_homography = _compute_homography_from_points(frame_calibration, field_w, field_h)
-                    except:
-                        frame_homography = homography
-            
-            player_detections = _detect_players_yolo(frame, yolo, frame_homography)
-            for player in player_detections:
-                players.append({
-                    "frame": frame_idx,
-                    "time": frame_idx / fps if fps > 0 else 0,
-                    "player_id": f"player_{frame_idx}_{player['id']}",
-                    "x_meters": player["x"],
-                    "y_meters": player["y"],
-                    "team": player["team"],
-                    "confidence": player["confidence"]
-                })
-            processed_count += 1
-        
-        frame_idx += 1
-    
-    cap.release()
-    
-    return {
-        "success": True,
-        "video_id": "",
-        "frame_count": total_frames,
-        "fps": fps,
-        "duration": duration,
-        "width": width,
-        "height": height,
-        "players": players,
-        "field_template": field_template,
-        "frames_processed": processed_count,
-        "calibration_points": len(initial_calibration) if initial_calibration else 0
-    }
+# ---------------------------------------------------------------------------
+# FastAPI web endpoints (no GPU — cheap to run)
+# ---------------------------------------------------------------------------
+
+web_app = fastapi.FastAPI()
 
 
-@app.function(image=image, gpu="H100")
-@modal.fastapi_endpoint(method="POST")
-def web_process(request: Dict[str, Any]) -> Dict[str, Any]:
-    """HTTP endpoint for video processing."""
-    import base64
-    
-    video_b64 = request.get("video_bytes", "")
-    video_bytes = base64.b64decode(video_b64)
-    calibration_points = request.get("calibration_points", [])
-    field_template = request.get("field_template", "11v11")
-    frame_interval = request.get("frame_interval", 30)
-    auto_calibrate = request.get("auto_calibrate", True)
-    
-    return process_video.remote(
-        video_bytes,
-        calibration_points,
-        field_template,
-        frame_interval,
-        auto_calibrate
-    )
+@web_app.post("/submit")
+async def submit(body: dict):
+    """Accept a job request. Spawn the GPU function async. Return call_id."""
+    video_url = body.get("video_url", "")
+    field_template = body.get("field_template", "9v9")
+
+    if not video_url:
+        return JSONResponse({"error": "video_url is required"}, status_code=400)
+
+    fn = modal.Function.from_name("soccer-analysis", "process_video")
+    call = fn.spawn(video_url, field_template)
+    call_id = call.object_id
+
+    progress_dict.put(call_id, {
+        "status": "processing",
+        "stage": "starting",
+        "percent": 0,
+    })
+
+    return {"call_id": call_id}
 
 
-def _detect_field_geometry(
-    frame: np.ndarray,
-    field_w: float,
-    field_h: float
-) -> List[Dict[str, float]]:
-    """Detect field using vanishing points and known field geometry."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=50, minLineLength=20, maxLineGap=15)
-    
-    if lines is None or len(lines) < 2:
-        return _edge_based_detection(frame, field_w, field_h)
-    
-    vertical_lines = []
-    horizontal_lines = []
-    
-    for line in lines[:50]:
-        rho, theta = line[0]
-        deg = np.degrees(theta)
-        if 80 < deg < 100:
-            vertical_lines.append((rho, theta))
-        elif -10 < deg < 10 or 170 < deg < 190:
-            horizontal_lines.append((rho, theta))
-    
-    vanishing_point = None
-    if vertical_lines and len(vertical_lines) >= 2:
-        vanishing_point = _estimate_vanishing_point(vertical_lines)
-    
-    frame_h, frame_w = frame.shape[:2]
-    points = []
-    
-    if vanishing_point and 0 < vanishing_point[0] < frame_w and 0 < vanishing_point[1] < frame_h:
-        points.append({
-            "pixel_x": float(vanishing_point[0]),
-            "pixel_y": float(vanishing_point[1]),
-            "field_x": field_w / 2,
-            "field_y": 0
-        })
-    
-    if vertical_lines:
-        sorted_v = sorted(vertical_lines, key=lambda x: x[0])
-        for rho, theta in sorted_v[:2]:
-            for y in [0, frame_h // 2, frame_h]:
-                x = (rho - y * np.cos(theta)) / (np.sin(theta) + 1e-6)
-                if 0 <= x < frame_w:
-                    points.append({
-                        "pixel_x": float(x),
-                        "pixel_y": float(y),
-                        "field_x": field_w if x > frame_w / 2 else 0,
-                        "field_y": (y / frame_h) * field_h
-                    })
-                    break
-    
-    if horizontal_lines:
-        sorted_h = sorted(horizontal_lines, key=lambda x: x[0])
-        for rho, theta in sorted_h[:2]:
-            for x in [0, frame_w // 2, frame_w]:
-                y = (rho - x * np.sin(theta)) / (np.cos(theta) + 1e-6)
-                if 0 <= y < frame_h:
-                    points.append({
-                        "pixel_x": float(x),
-                        "pixel_y": float(y),
-                        "field_x": (x / frame_w) * field_w,
-                        "field_y": field_h if y > frame_h / 2 else 0
-                    })
-                    break
-    
-    unique_points = []
-    seen = set()
-    for pt in points:
-        key = (int(pt["pixel_x"] // 20), int(pt["pixel_y"] // 20))
-        if key not in seen:
-            seen.add(key)
-            unique_points.append(pt)
-    
-    if len(unique_points) >= 4:
-        return unique_points[:8]
-    
-    return _edge_based_detection(frame, field_w, field_h)
+@web_app.get("/status/{call_id}")
+async def poll_status(call_id: str):
+    """Return current progress from modal.Dict. Cheap — no GPU cost."""
+    state = progress_dict.get(call_id, default=None)
+    if state is None:
+        return JSONResponse({"status": "unknown"}, status_code=404)
+    return state
 
 
-def _estimate_vanishing_point(lines: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
-    """Estimate vanishing point from parallel lines."""
-    if len(lines) < 2:
-        return None
-    
-    points = []
-    for rho, theta in lines[:10]:
-        normal = np.array([np.cos(theta), np.sin(theta)])
-        points.append(normal * rho)
-    
-    points = np.array(points)
-    
-    U, S, Vt = np.linalg.svd(points - points.mean(axis=0))
-    vanishing = Vt[-1]
-    
-    if abs(vanishing[2]) < 1e-6:
-        return None
-    
-    return (-vanishing[0] / vanishing[2], -vanishing[1] / vanishing[2])
-
-
-def _edge_based_detection(
-    frame: np.ndarray,
-    field_w: float,
-    field_h: float
-) -> List[Dict[str, float]]:
-    """Fallback using edge detection with field geometry constraints."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    green_lower = np.array([35, 40, 40])
-    green_upper = np.array([85, 255, 200])
-    field_mask = cv2.inRange(hsv, green_lower, green_upper)
-    
-    edges = cv2.Canny(gray, 30, 100)
-    field_edges = cv2.bitwise_and(edges, edges, mask=cv2.bitwise_not(field_mask))
-    
-    corners = cv2.goodFeaturesToTrack(field_edges, maxCorners=15, qualityLevel=0.1, minDistance=30)
-    
-    frame_h, frame_w = frame.shape[:2]
-    
-    if corners is not None and len(corners) >= 4:
-        corners = corners.reshape(-1, 2)
-        
-        center = corners.mean(axis=0)
-        
-        sorted_corners = sorted(corners, key=lambda p: np.arctan2(p[1] - center[1], p[0] - center[0]))
-        
-        result = []
-        for i, pt in enumerate(sorted_corners[:4]):
-            angle = np.arctan2(pt[1] - center[1], pt[0] - center[0])
-            
-            if -np.pi/4 <= angle < np.pi/4:
-                field_x, field_y = field_w, field_h / 2
-            elif np.pi/4 <= angle < 3*np.pi/4:
-                field_x, field_y = field_w / 2, field_h
-            elif angle >= 3*np.pi/4 or angle < -3*np.pi/4:
-                field_x, field_y = 0, field_h / 2
-            else:
-                field_x, field_y = field_w / 2, 0
-            
-            result.append({
-                "pixel_x": float(pt[0]),
-                "pixel_y": float(pt[1]),
-                "field_x": field_x,
-                "field_y": field_y
-            })
-        
+@web_app.get("/result/{call_id}")
+async def poll_result(call_id: str):
+    """Return 202 if still running, 200 with result if done."""
+    function_call = modal.FunctionCall.from_id(call_id)
+    try:
+        result = function_call.get(timeout=0)
         return result
-    
-    return [
-        {"pixel_x": frame_w * 0.2, "pixel_y": frame_h * 0.2, "field_x": 0, "field_y": 0},
-        {"pixel_x": frame_w * 0.8, "pixel_y": frame_h * 0.2, "field_x": field_w, "field_y": 0},
-        {"pixel_x": frame_w * 0.8, "pixel_y": frame_h * 0.8, "field_x": field_w, "field_y": field_h},
-        {"pixel_x": frame_w * 0.2, "pixel_y": frame_h * 0.8, "field_x": 0, "field_y": field_h}
+    except TimeoutError:
+        return JSONResponse({"status": "processing"}, status_code=202)
+
+
+@app.function()
+@modal.asgi_app()
+def fastapi_app():
+    return web_app
+
+
+# ---------------------------------------------------------------------------
+# GPU processing function
+# ---------------------------------------------------------------------------
+
+@app.function(
+    gpu="A10G",
+    image=image,
+    timeout=3600,
+    enable_memory_snapshot=True,
+    scaledown_window=300,
+)
+def process_video(video_url: str, field_template: str) -> dict:
+    """Process a soccer match video and return tracking data.
+
+    Currently returns mock data for end-to-end testing.
+    Real 7-stage CV pipeline will replace this in Task 15.
+
+    Args:
+        video_url: Public URL of the uploaded video (Vercel Blob)
+        field_template: Field size — always "9v9" for now
+
+    Returns:
+        ProcessingResult dict matching the TypeScript interface
+    """
+    call_id = modal.current_function_call_id()
+    d = modal.Dict.from_name("job-progress", create_if_missing=True)
+
+    # Simulate processing stages with progress updates
+    stages = [
+        ("transcoding", 5),
+        ("camera_motion", 15),
+        ("field_calibration", 30),
+        ("detection", 45),
+        ("tracking", 70),
+        ("classification", 85),
+        ("transform", 95),
     ]
 
+    for stage_name, percent in stages:
+        d.put(call_id, {
+            "status": "processing",
+            "stage": stage_name,
+            "percent": percent,
+        })
+        time.sleep(2)  # Simulate work (~14s total)
 
-def _compute_homography_from_points(
-    points: List[Dict[str, float]],
-    field_w: float,
-    field_h: float
-) -> np.ndarray:
-    """Compute homography from field points with RANSAC."""
-    if len(points) < 4:
-        raise ValueError("At least 4 calibration points required")
-    
-    src_points = [[pt["pixel_x"], pt["pixel_y"]] for pt in points[:4]]
-    dst_points = [[pt["field_x"], pt["field_y"]] for pt in points[:4]]
-    
-    src_pts = np.array(src_points, dtype=np.float32)
-    dst_pts = np.array(dst_points, dtype=np.float32)
-    
-    h, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    return h
+    # Generate mock player tracking data
+    # 18 players (9 home + 9 away), 10fps over 10 minutes
+    tracks = []
+    for i in range(18):
+        team = "home" if i < 9 else "away"
+        keyframes = []
 
+        # Start position — spread across the field
+        base_x = random.uniform(5, 50)
+        base_y = random.uniform(5, 31)
 
-def _compute_homography(
-    calibration_points: List[Dict[str, float]],
-    field_template: str
-) -> np.ndarray:
-    if len(calibration_points) < 4:
-        raise ValueError("At least 4 calibration points required")
-    
-    field_dims = {"9v9": (55, 36), "11v11": (105, 68)}
-    field_w, field_h = field_dims.get(field_template, (105, 68))
-    
-    src_points = [[pt["pixel_x"], pt["pixel_y"]] for pt in calibration_points]
-    dst_points = [[pt["field_x"], pt["field_y"]] for pt in calibration_points]
-    
-    src_pts = np.array(src_points, dtype=np.float32)
-    dst_pts = np.array(dst_points, dtype=np.float32)
-    
-    h, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    return h
+        for t in range(0, 600):  # 600 seconds = 10 minutes, 1 keyframe/sec
+            # Random walk around base position
+            x = max(0, min(55, base_x + random.gauss(0, 2)))
+            y = max(0, min(36, base_y + random.gauss(0, 1.5)))
+            base_x = x  # drift
+            base_y = y
 
-
-def _detect_players_yolo(
-    frame: np.ndarray,
-    yolo_model,
-    homography: np.ndarray,
-    confidence_threshold: float = 0.3
-) -> List[Dict[str, Any]]:
-    """Detect players using YOLO26 with field + green color + size filtering."""
-    results = yolo_model(frame, classes=[0], conf=confidence_threshold, verbose=False)
-    
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    green_lower = np.array([35, 40, 40])
-    green_upper = np.array([85, 255, 220])
-    field_mask = cv2.inRange(hsv, green_lower, green_upper)
-    
-    players = []
-    frame_h, frame_w = frame.shape[:2]
-    field_corners = _get_field_corners(frame_w, frame_h, homography)
-    
-    for idx, result in enumerate(results):
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
-            continue
-        
-        for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0].cpu().numpy())
-            
-            width = x2 - x1
-            height = y2 - y1
-            
-            if width < 15 or height < 30:
-                continue
-            
-            aspect_ratio = height / width if width > 0 else 0
-            if aspect_ratio < 0.8 or aspect_ratio > 6.0:
-                continue
-            
-            cx = int((x1 + x2) / 2)
-            cy = int((y2 - height * 0.1))
-            
-            if not _is_point_in_field(cx, cy, field_corners):
-                
-                if 0 <= cx < frame_w and 0 <= cy < frame_h:
-                    foot_y = int(y2)
-                    check_offsets = [0, -10, -20]
-                    green_count = 0
-                    for offset in check_offsets:
-                        fy = foot_y + offset
-                        if 0 <= fy < frame_h and 0 <= cx < frame_w:
-                            if field_mask[fy, cx] > 127:
-                                green_count += 1
-                    
-                    if green_count < 2:
-                        continue
-                else:
-                    continue
-            
-            field_coords = _apply_homography_point(cx, cy, homography)
-            
-            if field_coords[0] < -10 or field_coords[0] > field_w + 10:
-                continue
-            if field_coords[1] < -10 or field_coords[1] > field_h + 10:
-                continue
-            
-            color_at_center = frame[cy, cx] if 0 <= cy < frame_h and 0 <= cx < frame_w else np.array([0, 0, 0])
-            team = _determine_team_color(color_at_center)
-            
-            players.append({
-                "id": idx,
-                "x": float(field_coords[0]),
-                "y": float(field_coords[1]),
-                "team": team,
-                "confidence": conf
+            keyframes.append({
+                "time": float(t),
+                "x": round(x, 2),
+                "y": round(y, 2),
+                "confidence": round(random.uniform(0.7, 1.0), 3),
             })
-    
-    return players
 
+        tracks.append({
+            "player_id": f"track_{i + 1}",
+            "team": team,
+            "keyframes": keyframes,
+        })
 
-def _get_field_corners(width: int, height: int, homography: np.ndarray) -> List[Tuple[float, float]]:
-    corners = [(0, 0), (width, 0), (width, height), (0, height)]
-    return [_apply_homography_point(x, y, homography) for x, y in corners]
+    d.put(call_id, {
+        "status": "complete",
+        "stage": "done",
+        "percent": 100,
+    })
 
-
-def _is_point_in_field(x: float, y: float, corners: List[Tuple[float, float]]) -> bool:
-    n = len(corners)
-    if n == 0:
-        return True
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = corners[i]
-        xj, yj = corners[j]
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-6) + xi):
-            inside = not inside
-        j = i
-    return inside
-
-
-def _apply_homography_point(x: float, y: float, homography: np.ndarray) -> Tuple[float, float]:
-    pt = np.array([[x], [y], [1]])
-    transformed = homography @ pt
-    w = transformed[2, 0]
-    if abs(w) < 1e-6:
-        return (0.0, 0.0)
-    return (transformed[0, 0] / w, transformed[1, 0] / w)
-
-
-def _determine_team_color(bgr_color: np.ndarray) -> str:
-    b, g, r = bgr_color
-    if r > g + 20 and r > b + 20:
-        return "home"
-    elif b > g + 20 and b > r + 20:
-        return "away"
-    return "unknown"
-
-
-@app.local_entrypoint()
-def main():
-    print("Modal app deployed with PTZ-aware field geometry detection")
-    print("Uses vanishing point estimation + field line detection")
+    return {
+        "metadata": {
+            "video_id": "mock",
+            "fps": 30,
+            "detection_fps": 10,
+            "duration": 600.0,
+            "frame_count": 18000,
+            "field_template": field_template,
+            "periods": [{"start_time": 0, "end_time": 600}],
+            "processing_time_seconds": 14.0,
+        },
+        "tracks": tracks,
+    }
