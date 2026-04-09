@@ -174,6 +174,9 @@ def process_video(video_url: str, field_template: str) -> dict:
     CALIBRATION_INTERVAL = 30  # run PnLCalib every Nth frame
     ECC_DOWNSAMPLE = (640, 360)  # downsample for ECC speed
     MAX_COLOR_SAMPLES = 500  # reservoir sampling cap
+    BALL_CONF_THRESHOLD = 0.15  # lower threshold for ball (small, often low-conf)
+    BALL_BUFFER_SIZE = 10  # frames of ball position history for outlier rejection
+    BALL_MAX_JUMP_PX = 200  # max pixels ball can move between detections (reject outliers)
 
     def update_progress(stage: str, percent: int):
         d.put(call_id, {"status": "processing", "stage": stage, "percent": percent})
@@ -274,6 +277,8 @@ def process_video(video_url: str, field_template: str) -> dict:
 
     # Ball positions: { frame_idx: (center_x_px, center_y_px, conf) }
     ball_positions = {}
+    # Ball centroid tracker: recent positions for outlier rejection
+    ball_history = []  # list of (center_x, center_y) from recent frames
 
     # Motion scores for halftime detection
     motion_scores = []
@@ -417,7 +422,8 @@ def process_video(video_url: str, field_template: str) -> dict:
 
             # Process in batches of 8
             if len(detection_batch) >= 8:
-                results = yolo_model(detection_batch, classes=[0, 32], conf=0.25, imgsz=1088, verbose=False)
+                # Use lower conf to catch ball detections (ball is small, often low-conf)
+                results = yolo_model(detection_batch, classes=[0, 32], conf=BALL_CONF_THRESHOLD, imgsz=1088, verbose=False)
                 for batch_i, result in enumerate(results):
                     fidx = detection_batch_indices[batch_i]
                     detections = sv.Detections.from_ultralytics(result)
@@ -427,18 +433,45 @@ def process_video(video_url: str, field_template: str) -> dict:
                         ball_mask = detections.class_id == 32
                         person_mask = detections.class_id == 0
 
-                        # Store best ball detection for this frame
+                        # Ball tracking with centroid-based outlier rejection
                         ball_dets = detections[ball_mask]
                         if len(ball_dets) > 0 and ball_dets.confidence is not None:
-                            best_ball_idx = int(np.argmax(ball_dets.confidence))
-                            bx1, by1, bx2, by2 = ball_dets.xyxy[best_ball_idx]
-                            ball_positions[fidx] = (
-                                float((bx1 + bx2) / 2),
-                                float((by1 + by2) / 2),
-                                float(ball_dets.confidence[best_ball_idx]),
-                            )
+                            # Find the best ball detection
+                            centers = np.column_stack([
+                                (ball_dets.xyxy[:, 0] + ball_dets.xyxy[:, 2]) / 2,
+                                (ball_dets.xyxy[:, 1] + ball_dets.xyxy[:, 3]) / 2,
+                            ])
 
-                        detections = detections[person_mask]
+                            if ball_history:
+                                # Compute centroid of recent ball positions
+                                centroid = np.mean(ball_history[-BALL_BUFFER_SIZE:], axis=0)
+                                # Pick detection closest to recent centroid
+                                dists = np.linalg.norm(centers - centroid, axis=1)
+                                best_ball_idx = int(np.argmin(dists))
+                                # Reject if too far from recent history (likely false positive)
+                                if dists[best_ball_idx] > BALL_MAX_JUMP_PX:
+                                    best_ball_idx = -1  # skip this frame
+                            else:
+                                # No history yet — take highest confidence
+                                best_ball_idx = int(np.argmax(ball_dets.confidence))
+
+                            if best_ball_idx >= 0:
+                                bx, by = float(centers[best_ball_idx][0]), float(centers[best_ball_idx][1])
+                                ball_positions[fidx] = (
+                                    bx, by,
+                                    float(ball_dets.confidence[best_ball_idx]),
+                                )
+                                ball_history.append([bx, by])
+                                if len(ball_history) > BALL_BUFFER_SIZE:
+                                    ball_history.pop(0)
+
+                        # Filter person detections back to higher confidence
+                        person_dets = detections[person_mask]
+                        if len(person_dets) > 0 and person_dets.confidence is not None:
+                            high_conf = person_dets.confidence >= 0.25
+                            detections = person_dets[high_conf]
+                        else:
+                            detections = person_dets
 
                     # Filter by bbox size and aspect ratio (players only)
                     if len(detections) > 0:
@@ -493,25 +526,39 @@ def process_video(video_url: str, field_template: str) -> dict:
 
     # Flush remaining detection batch
     if detection_batch:
-        results = yolo_model(detection_batch, classes=[0, 32], conf=0.25, imgsz=1088, verbose=False)
+        results = yolo_model(detection_batch, classes=[0, 32], conf=BALL_CONF_THRESHOLD, imgsz=1088, verbose=False)
         for batch_i, result in enumerate(results):
             fidx = detection_batch_indices[batch_i]
             detections = sv.Detections.from_ultralytics(result)
 
-            # Separate ball from person detections
+            # Separate ball from person detections (same logic as main loop)
             if len(detections) > 0 and detections.class_id is not None:
                 ball_mask = detections.class_id == 32
                 person_mask = detections.class_id == 0
                 ball_dets = detections[ball_mask]
                 if len(ball_dets) > 0 and ball_dets.confidence is not None:
-                    best_ball_idx = int(np.argmax(ball_dets.confidence))
-                    bx1, by1, bx2, by2 = ball_dets.xyxy[best_ball_idx]
-                    ball_positions[fidx] = (
-                        float((bx1 + bx2) / 2),
-                        float((by1 + by2) / 2),
-                        float(ball_dets.confidence[best_ball_idx]),
-                    )
-                detections = detections[person_mask]
+                    centers = np.column_stack([
+                        (ball_dets.xyxy[:, 0] + ball_dets.xyxy[:, 2]) / 2,
+                        (ball_dets.xyxy[:, 1] + ball_dets.xyxy[:, 3]) / 2,
+                    ])
+                    if ball_history:
+                        centroid = np.mean(ball_history[-BALL_BUFFER_SIZE:], axis=0)
+                        dists = np.linalg.norm(centers - centroid, axis=1)
+                        best_ball_idx = int(np.argmin(dists))
+                        if dists[best_ball_idx] > BALL_MAX_JUMP_PX:
+                            best_ball_idx = -1
+                    else:
+                        best_ball_idx = int(np.argmax(ball_dets.confidence))
+                    if best_ball_idx >= 0:
+                        bx, by = float(centers[best_ball_idx][0]), float(centers[best_ball_idx][1])
+                        ball_positions[fidx] = (bx, by, float(ball_dets.confidence[best_ball_idx]))
+                        ball_history.append([bx, by])
+
+                person_dets = detections[person_mask]
+                if len(person_dets) > 0 and person_dets.confidence is not None:
+                    detections = person_dets[person_dets.confidence >= 0.25]
+                else:
+                    detections = person_dets
 
             if len(detections) > 0:
                 heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
