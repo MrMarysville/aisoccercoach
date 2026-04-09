@@ -774,17 +774,79 @@ def process_video(video_url: str, field_template: str) -> dict:
     update_progress("transform", 98)
 
     # -----------------------------------------------------------------------
+    # Speed estimation (post-processing)
+    # -----------------------------------------------------------------------
+    # For each track, compute speed (m/s and km/h) from consecutive positions.
+    # Smoothed over a 1-second window to reduce jitter from detection noise.
+    SPEED_WINDOW = max(1, int(fps / DETECTION_INTERVAL))  # ~10 frames at 30fps/3
+
+    for track_id, keyframes in output_tracks.items():
+        if len(keyframes) < 2:
+            continue
+
+        # Compute instantaneous speed between consecutive keyframes
+        speeds = [0.0]  # first frame has no speed
+        for i in range(1, len(keyframes)):
+            prev_kf = keyframes[i - 1]
+            curr_kf = keyframes[i]
+            dt = curr_kf["time"] - prev_kf["time"]
+            if dt > 0:
+                dx = curr_kf["x"] - prev_kf["x"]
+                dy = curr_kf["y"] - prev_kf["y"]
+                dist = (dx ** 2 + dy ** 2) ** 0.5
+                speed_ms = dist / dt
+                # Cap at realistic max player speed (12 m/s ≈ 43 km/h sprint)
+                speed_ms = min(speed_ms, 12.0)
+                speeds.append(speed_ms)
+            else:
+                speeds.append(speeds[-1] if speeds else 0.0)
+
+        # Smooth with rolling average (1-second window)
+        smoothed = []
+        for i in range(len(speeds)):
+            window_start = max(0, i - SPEED_WINDOW + 1)
+            window = speeds[window_start:i + 1]
+            smoothed.append(sum(window) / len(window))
+
+        # Add speed to each keyframe
+        for i, kf in enumerate(keyframes):
+            kf["speed_ms"] = round(smoothed[i], 2)
+            kf["speed_kmh"] = round(smoothed[i] * 3.6, 1)
+
+    # -----------------------------------------------------------------------
     # Build output
     # -----------------------------------------------------------------------
+    # Track-level stats: total distance, avg/max speed
     tracks_list = []
     for track_id in sorted(output_tracks.keys()):
         keyframes = output_tracks[track_id]
         if len(keyframes) < 3:
             continue  # skip very short tracks (noise)
+
+        # Compute total distance covered
+        total_distance = 0.0
+        max_speed = 0.0
+        for i in range(1, len(keyframes)):
+            dx = keyframes[i]["x"] - keyframes[i - 1]["x"]
+            dy = keyframes[i]["y"] - keyframes[i - 1]["y"]
+            total_distance += (dx ** 2 + dy ** 2) ** 0.5
+            if keyframes[i].get("speed_ms", 0) > max_speed:
+                max_speed = keyframes[i]["speed_ms"]
+
+        avg_speed = 0.0
+        speed_values = [kf.get("speed_ms", 0) for kf in keyframes if kf.get("speed_ms", 0) > 0]
+        if speed_values:
+            avg_speed = sum(speed_values) / len(speed_values)
+
         tracks_list.append({
             "player_id": f"track_{track_id}",
             "team": track_team.get(track_id, "unknown"),
             "keyframes": keyframes,
+            "stats": {
+                "total_distance_m": round(total_distance, 1),
+                "avg_speed_kmh": round(avg_speed * 3.6, 1),
+                "max_speed_kmh": round(max_speed * 3.6, 1),
+            },
         })
 
     processing_time = time.time() - start_time

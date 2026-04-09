@@ -35,6 +35,13 @@ export interface Track {
   player_id: string;
   team: TeamLabel;
   keyframes: Keyframe[];
+  stats?: TrackStats;
+}
+
+export interface TrackStats {
+  total_distance_m: number;
+  avg_speed_kmh: number;
+  max_speed_kmh: number;
 }
 
 export type TeamLabel = 'home' | 'away' | 'referee' | 'unknown';
@@ -44,6 +51,8 @@ export interface Keyframe {
   x: number;
   y: number;
   confidence: number;
+  speed_ms?: number;
+  speed_kmh?: number;
 }
 
 export interface JobStatus {
