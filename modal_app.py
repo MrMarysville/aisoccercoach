@@ -8,8 +8,6 @@ Deploy: modal deploy modal_app.py
 """
 
 import modal
-import fastapi
-from fastapi.responses import JSONResponse
 import time
 
 app = modal.App("soccer-analysis")
@@ -37,6 +35,7 @@ image = (
         "PyYAML==6.0.2",
         "tqdm",
         "requests",
+        "fastapi[standard]",
     ])
     .run_commands([
         # PnLCalib (not on PyPI — must clone)
@@ -60,7 +59,11 @@ progress_dict = modal.Dict.from_name("job-progress", create_if_missing=True)
 
 # ---------------------------------------------------------------------------
 # FastAPI web endpoints (no GPU — cheap to run)
+# Imports are here (not top-level) because the GPU image doesn't have fastapi
 # ---------------------------------------------------------------------------
+
+import fastapi
+from fastapi.responses import JSONResponse
 
 web_app = fastapi.FastAPI()
 
