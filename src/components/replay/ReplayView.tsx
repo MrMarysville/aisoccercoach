@@ -24,10 +24,20 @@ export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayView
       const response = await fetch(`/api/process/result/${jobId}`);
       if (response.ok) {
         const data: ProcessingResult = await response.json();
+        if (!data.tracks || data.tracks.length === 0) {
+          setError('Processing completed but no players were detected. Try a different video with visible players on a field.');
+          return;
+        }
         setResult(data);
+      } else if (response.status === 202) {
+        // Still processing — this shouldn't happen but handle it
+        setError('Results not ready yet. Please wait and try again.');
+      } else {
+        const err = await response.json().catch(() => ({ error: 'Unknown error' }));
+        setError((err as { error?: string }).error ?? `Failed to load results (${response.status})`);
       }
     } catch {
-      setError('Failed to load results');
+      setError('Failed to load results. Please check your connection and try again.');
     }
   }, [jobId]);
 

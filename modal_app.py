@@ -167,6 +167,26 @@ def process_video(video_url: str, field_template: str) -> dict:
     call_id = modal.current_function_call_id()
     d = modal.Dict.from_name("job-progress", create_if_missing=True)
 
+    try:
+        return _process_video_impl(
+            video_url, field_template, start_time, call_id, d,
+            subprocess, os, random, requests, cv2, np, Path,
+            defaultdict, YOLO, BotSort, KMeans, sv,
+        )
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[ERROR] Pipeline failed: {error_msg}")
+        d.put(call_id, {"status": "failed", "stage": "error", "percent": 0, "error": error_msg})
+        raise
+
+
+def _process_video_impl(
+    video_url, field_template, start_time, call_id, d,
+    subprocess, os, random, requests, cv2, np, Path,
+    defaultdict, YOLO, BotSort, KMeans, sv,
+):
+    """Internal implementation — wrapped by process_video for error handling."""
+
     # Field dimensions (meters)
     FIELD_W = 55.0 if field_template == "9v9" else 105.0
     FIELD_H = 36.0 if field_template == "9v9" else 68.0

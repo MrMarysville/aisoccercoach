@@ -13,9 +13,12 @@ export default function Home() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [cachedResult, setCachedResult] = useState<ProcessingResult | null>(null);
 
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
   const handleUploadComplete = useCallback(async (blobUrl: string, id: string) => {
     setVideoSrc(blobUrl);
     setActiveTab('replay');
+    setSubmitError(null);
 
     try {
       const response = await fetch('/api/process', {
@@ -23,6 +26,12 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ video_url: blobUrl, video_id: id }),
       });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: 'Server error' }));
+        setSubmitError((err as { error?: string }).error ?? `Processing failed (${response.status})`);
+        return;
+      }
 
       const data: Record<string, unknown> = await response.json();
 
@@ -34,8 +43,8 @@ export default function Home() {
         const jobResponse = data as unknown as ProcessJobResponse;
         setJobId(jobResponse.job_id);
       }
-    } catch (error) {
-      console.error('Failed to start processing:', error);
+    } catch {
+      setSubmitError('Failed to connect to server. Please try again.');
     }
   }, []);
 
@@ -73,7 +82,19 @@ export default function Home() {
           )}
 
           {activeTab === 'replay' && videoSrc && (
-            <ReplayView videoSrc={videoSrc} jobId={jobId} cachedResult={cachedResult} />
+            submitError ? (
+              <div className="card p-12 flex flex-col items-center gap-4">
+                <p className="text-error font-medium">{submitError}</p>
+                <button
+                  onClick={() => { setSubmitError(null); setActiveTab('upload'); }}
+                  className="btn btn-primary"
+                >
+                  Try Again
+                </button>
+              </div>
+            ) : (
+              <ReplayView videoSrc={videoSrc} jobId={jobId} cachedResult={cachedResult} />
+            )
           )}
         </div>
       </main>

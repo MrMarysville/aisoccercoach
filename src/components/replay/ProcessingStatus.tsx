@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { JobStatus } from '@/types/replay';
 
 interface ProcessingStatusProps {
@@ -14,12 +14,16 @@ const STAGE_LABELS: Record<string, string> = {
   transcoding: 'Transcoding video',
   camera_motion: 'Analyzing camera motion',
   field_calibration: 'Detecting field lines',
-  detection: 'Detecting players',
+  detection: 'Detecting players & ball',
   tracking: 'Tracking players',
   classification: 'Classifying teams',
   transform: 'Computing positions',
   done: 'Complete',
 };
+
+const POLL_INTERVAL = 5000;
+const MAX_CONSECUTIVE_FAILURES = 6; // 30s of failed polls before showing error
+const PROCESSING_TIMEOUT = 30 * 60 * 1000; // 30 minutes max
 
 export default function ProcessingStatus({
   jobId,
@@ -31,25 +35,66 @@ export default function ProcessingStatus({
     stage: 'starting',
     percent: 0,
   });
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const startTimeRef = useRef(0);
+
+  // Initialize start time in effect (not during render)
+  useEffect(() => {
+    startTimeRef.current = Date.now();
+  }, []);
+
+  // Tick elapsed time every second
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (startTimeRef.current > 0) {
+        setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000));
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   const poll = useCallback(async () => {
+    // Check timeout
+    if (startTimeRef.current > 0 && Date.now() - startTimeRef.current > PROCESSING_TIMEOUT) {
+      onError('Processing timed out after 30 minutes. The video may be too long or the server may be overloaded.');
+      return;
+    }
+
     try {
       const response = await fetch(`/api/process/status/${jobId}`);
-      if (!response.ok) return;
 
+      if (!response.ok) {
+        setConsecutiveFailures(prev => {
+          const next = prev + 1;
+          if (next >= MAX_CONSECUTIVE_FAILURES) {
+            onError(`Lost connection to server (${response.status}). Please refresh and try again.`);
+          }
+          return next;
+        });
+        return;
+      }
+
+      setConsecutiveFailures(0);
       const data: JobStatus = await response.json();
       setStatus(data);
 
       if (data.status === 'complete') onComplete();
       if (data.status === 'failed') onError(data.error ?? 'Processing failed');
     } catch {
-      // Silent failure — will retry on next poll
+      setConsecutiveFailures(prev => {
+        const next = prev + 1;
+        if (next >= MAX_CONSECUTIVE_FAILURES) {
+          onError('Lost connection to server. Please check your internet and try again.');
+        }
+        return next;
+      });
     }
   }, [jobId, onComplete, onError]);
 
   useEffect(() => {
     const timeout = setTimeout(poll, 0);
-    const interval = setInterval(poll, 5000);
+    const interval = setInterval(poll, POLL_INTERVAL);
     return () => {
       clearTimeout(timeout);
       clearInterval(interval);
@@ -58,6 +103,8 @@ export default function ProcessingStatus({
 
   const stageLabel = STAGE_LABELS[status.stage ?? ''] ?? status.stage ?? 'Processing';
   const percent = status.percent ?? 0;
+  const elapsedMin = Math.floor(elapsedSeconds / 60);
+  const elapsedSec = elapsedSeconds % 60;
 
   return (
     <div className="card p-12 flex flex-col items-center gap-4">
@@ -69,9 +116,6 @@ export default function ProcessingStatus({
         <p className="font-medium text-on-surface">{stageLabel}</p>
         <p className="text-sm text-on-surface-secondary">
           {percent}% complete
-          {status.eta_seconds != null
-            ? ` \u2022 ~${Math.ceil(status.eta_seconds / 60)} min remaining`
-            : ''}
         </p>
       </div>
       <div
@@ -84,7 +128,8 @@ export default function ProcessingStatus({
         />
       </div>
       <p className="text-xs text-on-surface-secondary">
-        Processing typically takes 20–25 minutes for a full match
+        {elapsedMin > 0 ? `${elapsedMin}m ${elapsedSec}s elapsed` : `${elapsedSec}s elapsed`}
+        {consecutiveFailures > 0 && ' (reconnecting...)'}
       </p>
     </div>
   );
