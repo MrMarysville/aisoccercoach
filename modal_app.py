@@ -251,7 +251,7 @@ def process_video(video_url: str, field_template: str) -> dict:
             slice_wh=(BALL_SAHI_SLICE, BALL_SAHI_SLICE),
             overlap_wh=(BALL_SAHI_OVERLAP, BALL_SAHI_OVERLAP),
             overlap_filter=sv.OverlapFilter.NON_MAX_SUPPRESSION,
-            iou_threshold=0.3,
+            iou_threshold=0.1,  # very low — one ball exists, don't over-suppress tile duplicates
         )
         dets = slicer(frame)
         # Apply ball size filter
