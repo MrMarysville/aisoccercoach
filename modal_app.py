@@ -176,7 +176,9 @@ def process_video(video_url: str, field_template: str) -> dict:
     MAX_COLOR_SAMPLES = 500  # reservoir sampling cap
     BALL_CONF_THRESHOLD = 0.15  # lower threshold for ball (small, often low-conf)
     BALL_BUFFER_SIZE = 10  # frames of ball position history for outlier rejection
-    BALL_MAX_JUMP_PX = 200  # max pixels ball can move between detections (reject outliers)
+    BALL_MAX_JUMP_PX = 350  # max pixels ball can move between detections (long passes cross 300+px)
+    BALL_MIN_SIZE_PX = 5  # minimum ball bbox dimension (filter noise)
+    BALL_MAX_SIZE_PX = 80  # maximum ball bbox dimension (filter non-ball objects)
 
     def update_progress(stage: str, percent: int):
         d.put(call_id, {"status": "processing", "stage": stage, "percent": percent})
@@ -433,8 +435,17 @@ def process_video(video_url: str, field_template: str) -> dict:
                         ball_mask = detections.class_id == 32
                         person_mask = detections.class_id == 0
 
-                        # Ball tracking with centroid-based outlier rejection
+                        # Ball tracking with size filter + centroid-based outlier rejection
                         ball_dets = detections[ball_mask]
+                        if len(ball_dets) > 0 and ball_dets.confidence is not None:
+                            # Filter by ball size — reject noise (too small) and non-ball (too large)
+                            bwidths = ball_dets.xyxy[:, 2] - ball_dets.xyxy[:, 0]
+                            bheights = ball_dets.xyxy[:, 3] - ball_dets.xyxy[:, 1]
+                            bsize_mask = (
+                                (bwidths >= BALL_MIN_SIZE_PX) & (bwidths <= BALL_MAX_SIZE_PX) &
+                                (bheights >= BALL_MIN_SIZE_PX) & (bheights <= BALL_MAX_SIZE_PX)
+                            )
+                            ball_dets = ball_dets[bsize_mask]
                         if len(ball_dets) > 0 and ball_dets.confidence is not None:
                             # Find the best ball detection
                             centers = np.column_stack([
@@ -536,6 +547,14 @@ def process_video(video_url: str, field_template: str) -> dict:
                 ball_mask = detections.class_id == 32
                 person_mask = detections.class_id == 0
                 ball_dets = detections[ball_mask]
+                if len(ball_dets) > 0 and ball_dets.confidence is not None:
+                    bwidths = ball_dets.xyxy[:, 2] - ball_dets.xyxy[:, 0]
+                    bheights = ball_dets.xyxy[:, 3] - ball_dets.xyxy[:, 1]
+                    bsize_mask = (
+                        (bwidths >= BALL_MIN_SIZE_PX) & (bwidths <= BALL_MAX_SIZE_PX) &
+                        (bheights >= BALL_MIN_SIZE_PX) & (bheights <= BALL_MAX_SIZE_PX)
+                    )
+                    ball_dets = ball_dets[bsize_mask]
                 if len(ball_dets) > 0 and ball_dets.confidence is not None:
                     centers = np.column_stack([
                         (ball_dets.xyxy[:, 0] + ball_dets.xyxy[:, 2]) / 2,
