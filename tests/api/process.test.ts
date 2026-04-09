@@ -7,16 +7,10 @@ vi.mock('@/lib/modal-client', () => ({
   getResult: vi.fn(),
 }));
 
-vi.mock('@vercel/blob', () => ({
-  list: vi.fn(),
-  put: vi.fn(),
-}));
-
 import { POST } from '@/app/api/process/route';
 import { GET as getStatus } from '@/app/api/process/status/[jobId]/route';
 import { GET as getResult } from '@/app/api/process/result/[jobId]/route';
 import { submitJob, pollStatus, getResult as getResultFn } from '@/lib/modal-client';
-import { list } from '@vercel/blob';
 import { NextRequest } from 'next/server';
 import type { ProcessingResult } from '@/types/replay';
 
@@ -34,24 +28,6 @@ function createPostRequest(body: Record<string, unknown>): NextRequest {
 
 function createGetRequest(url: string): NextRequest {
   return new NextRequest(url);
-}
-
-/**
- * Build a minimal ListBlobResult-compatible object that satisfies @vercel/blob's
- * return shape without importing the private type directly.
- */
-function makeBlobList(urls: string[]): Awaited<ReturnType<typeof list>> {
-  return {
-    blobs: urls.map((url) => ({
-      url,
-      pathname: url,
-      size: 0,
-      uploadedAt: new Date(),
-      downloadUrl: url,
-    })),
-    cursor: undefined,
-    hasMore: false,
-  } as unknown as Awaited<ReturnType<typeof list>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,43 +61,11 @@ describe('POST /api/process', () => {
     expect(response.status).toBe(400);
   });
 
-  it('returns cached result when blob exists for video_id prefix', async () => {
-    vi.mocked(list).mockResolvedValue(
-      makeBlobList(['https://blob.example.com/test-123_result.json'])
-    );
-
-    const request = createPostRequest({
-      video_url: 'https://blob.example.com/v.mp4',
-      video_id: 'test-123',
-    });
-    const response = await POST(request);
-    expect(response.status).toBe(200);
-
-    const data = await response.json() as { cached: boolean; result_url: string };
-    expect(data.cached).toBe(true);
-    expect(data.result_url).toBe('https://blob.example.com/test-123_result.json');
-    expect(submitJob).not.toHaveBeenCalled();
-  });
-
-  it('checks blob with correct prefix derived from video_id', async () => {
-    vi.mocked(list).mockResolvedValue(makeBlobList([]));
-    vi.mocked(submitJob).mockResolvedValue('fc-job-999');
-
-    const request = createPostRequest({
-      video_url: 'https://blob.example.com/v.mp4',
-      video_id: 'my-video',
-    });
-    await POST(request);
-
-    expect(list).toHaveBeenCalledWith({ prefix: 'my-video_result' });
-  });
-
-  it('submits to Modal when no cached blob exists', async () => {
-    vi.mocked(list).mockResolvedValue(makeBlobList([]));
+  it('submits to Modal and returns job_id', async () => {
     vi.mocked(submitJob).mockResolvedValue('fc-job-456');
 
     const request = createPostRequest({
-      video_url: 'https://blob.example.com/v.mp4',
+      video_url: 'https://blob.vercel-storage.com/v.mp4',
       video_id: 'test-123',
     });
     const response = await POST(request);
@@ -129,11 +73,10 @@ describe('POST /api/process', () => {
 
     const data = await response.json() as { job_id: string };
     expect(data.job_id).toBe('fc-job-456');
-    expect(submitJob).toHaveBeenCalledWith('https://blob.example.com/v.mp4', '9v9');
+    expect(submitJob).toHaveBeenCalledWith('https://blob.vercel-storage.com/v.mp4', '9v9');
   });
 
   it('passes video_url and hardcoded 9v9 template to submitJob', async () => {
-    vi.mocked(list).mockResolvedValue(makeBlobList([]));
     vi.mocked(submitJob).mockResolvedValue('fc-job-789');
 
     const request = createPostRequest({
@@ -146,11 +89,10 @@ describe('POST /api/process', () => {
   });
 
   it('returns 500 when submitJob throws', async () => {
-    vi.mocked(list).mockResolvedValue(makeBlobList([]));
     vi.mocked(submitJob).mockRejectedValue(new Error('Modal is down'));
 
     const request = createPostRequest({
-      video_url: 'https://blob.example.com/v.mp4',
+      video_url: 'https://blob.vercel-storage.com/v.mp4',
       video_id: 'test-123',
     });
     const response = await POST(request);
@@ -158,17 +100,6 @@ describe('POST /api/process', () => {
 
     const data = await response.json() as { error: string };
     expect(data.error).toBe('Modal is down');
-  });
-
-  it('returns 500 when list() throws', async () => {
-    vi.mocked(list).mockRejectedValue(new Error('Blob store unavailable'));
-
-    const request = createPostRequest({
-      video_url: 'https://blob.example.com/v.mp4',
-      video_id: 'test-123',
-    });
-    const response = await POST(request);
-    expect(response.status).toBe(500);
   });
 });
 
