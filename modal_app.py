@@ -28,7 +28,7 @@ image = (
         "boxmot",
         "opencv-python-headless==4.10.0.84",
         "scikit-learn",
-        "supervision>=0.26.0",
+        "supervision>=0.27.0",
         "scipy==1.13.1",
         "shapely==2.0.7",
         "munkres==1.1.4",
@@ -133,14 +133,15 @@ def fastapi_app():
 def process_video(video_url: str, field_template: str) -> dict:
     """Process a soccer match video through a 7-stage CV pipeline.
 
-    Pipeline (single-pass + post-processing):
+    Pipeline (two-pass detection + post-processing):
         1. Download + transcode (FFmpeg H.265→H.264)
         2. ECC camera motion estimation (every frame)
         3. PnLCalib field calibration (every 30th frame)
-        4. YOLO26m player+ball detection (every 3rd frame, batch=8, imgsz=1088)
-        5. BoT-SORT tracking with CMC (every 3rd frame)
+        4a. YOLO26m player detection (every 3rd frame, batch=8, imgsz=1088)
+        4b. SAHI tiled ball detection (every 3rd frame, 640x640 tiles, classes=[32])
+        5. BoT-SORT tracking with CMC (players) + centroid tracker (ball)
         6. K-Means team classification (post-processing)
-        7. Homography coordinate transform (post-processing)
+        7. Homography coordinate transform + speed estimation (post-processing)
 
     Args:
         video_url: Public URL of the uploaded video (Vercel Blob)
@@ -174,11 +175,13 @@ def process_video(video_url: str, field_template: str) -> dict:
     CALIBRATION_INTERVAL = 30  # run PnLCalib every Nth frame
     ECC_DOWNSAMPLE = (640, 360)  # downsample for ECC speed
     MAX_COLOR_SAMPLES = 500  # reservoir sampling cap
-    BALL_CONF_THRESHOLD = 0.15  # lower threshold for ball (small, often low-conf)
-    BALL_BUFFER_SIZE = 10  # frames of ball position history for outlier rejection
-    BALL_MAX_JUMP_PX = 350  # max pixels ball can move between detections (long passes cross 300+px)
-    BALL_MIN_SIZE_PX = 5  # minimum ball bbox dimension (filter noise)
-    BALL_MAX_SIZE_PX = 80  # maximum ball bbox dimension (filter non-ball objects)
+    BALL_CONF_THRESHOLD = 0.1   # low threshold for SAHI ball detection (small, often low-conf)
+    BALL_SAHI_SLICE = 640       # SAHI tile size (ball becomes 30-50px within each tile)
+    BALL_SAHI_OVERLAP = 128     # tile overlap in pixels (prevents missing balls at edges)
+    BALL_BUFFER_SIZE = 10       # frames of ball position history for outlier rejection
+    BALL_MAX_JUMP_PX = 350      # max pixels ball can move between detections
+    BALL_MIN_SIZE_PX = 5        # minimum ball bbox dimension (filter noise)
+    BALL_MAX_SIZE_PX = 80       # maximum ball bbox dimension (filter non-ball objects)
 
     def update_progress(stage: str, percent: int):
         d.put(call_id, {"status": "processing", "stage": stage, "percent": percent})
@@ -232,6 +235,61 @@ def process_video(video_url: str, field_template: str) -> dict:
         cmc_method="ecc",
         track_buffer=60,  # ~2s at 30fps — covers most occlusions in soccer
     )
+
+    # SAHI ball detector: runs YOLO on 640x640 tiles for small-object ball detection
+    def detect_ball_sahi(frame):
+        """Run tiled inference on a single frame for ball detection only.
+        Returns sv.Detections with ball detections from all tiles merged via NMS.
+        """
+        def _ball_callback(image_slice):
+            result = yolo_model(image_slice, classes=[32], conf=BALL_CONF_THRESHOLD,
+                                imgsz=BALL_SAHI_SLICE, verbose=False)[0]
+            return sv.Detections.from_ultralytics(result)
+
+        slicer = sv.InferenceSlicer(
+            callback=_ball_callback,
+            slice_wh=(BALL_SAHI_SLICE, BALL_SAHI_SLICE),
+            overlap_wh=(BALL_SAHI_OVERLAP, BALL_SAHI_OVERLAP),
+            overlap_filter=sv.OverlapFilter.NON_MAX_SUPPRESSION,
+            iou_threshold=0.3,
+        )
+        dets = slicer(frame)
+        # Apply ball size filter
+        if len(dets) > 0:
+            bwidths = dets.xyxy[:, 2] - dets.xyxy[:, 0]
+            bheights = dets.xyxy[:, 3] - dets.xyxy[:, 1]
+            bsize_mask = (
+                (bwidths >= BALL_MIN_SIZE_PX) & (bwidths <= BALL_MAX_SIZE_PX) &
+                (bheights >= BALL_MIN_SIZE_PX) & (bheights <= BALL_MAX_SIZE_PX)
+            )
+            dets = dets[bsize_mask]
+        return dets
+
+    def pick_best_ball(ball_dets, ball_history_list):
+        """From a set of ball detections, pick the best one using centroid tracking.
+        Returns (center_x, center_y, confidence) or None.
+        """
+        if len(ball_dets) == 0 or ball_dets.confidence is None:
+            return None
+        centers = np.column_stack([
+            (ball_dets.xyxy[:, 0] + ball_dets.xyxy[:, 2]) / 2,
+            (ball_dets.xyxy[:, 1] + ball_dets.xyxy[:, 3]) / 2,
+        ])
+        if ball_history_list:
+            centroid = np.mean(ball_history_list[-BALL_BUFFER_SIZE:], axis=0)
+            dists = np.linalg.norm(centers - centroid, axis=1)
+            best_idx = int(np.argmin(dists))
+            if dists[best_idx] > BALL_MAX_JUMP_PX:
+                return None
+        else:
+            best_idx = int(np.argmax(ball_dets.confidence))
+        bx = float(centers[best_idx][0])
+        by = float(centers[best_idx][1])
+        conf = float(ball_dets.confidence[best_idx])
+        ball_history_list.append([bx, by])
+        if len(ball_history_list) > BALL_BUFFER_SIZE:
+            ball_history_list.pop(0)
+        return (bx, by, conf)
 
     # Try to load PnLCalib models (may fail if repo structure differs)
     pnlcalib_available = False
@@ -424,65 +482,11 @@ def process_video(video_url: str, field_template: str) -> dict:
 
             # Process in batches of 8
             if len(detection_batch) >= 8:
-                # Use lower conf to catch ball detections (ball is small, often low-conf)
-                results = yolo_model(detection_batch, classes=[0, 32], conf=BALL_CONF_THRESHOLD, imgsz=1088, verbose=False)
+                # --- Pass 1: Player detection (standard YOLO at 1088px) ---
+                results = yolo_model(detection_batch, classes=[0], conf=0.25, imgsz=1088, verbose=False)
                 for batch_i, result in enumerate(results):
                     fidx = detection_batch_indices[batch_i]
                     detections = sv.Detections.from_ultralytics(result)
-
-                    # Separate ball detections (class 32) from person detections (class 0)
-                    if len(detections) > 0 and detections.class_id is not None:
-                        ball_mask = detections.class_id == 32
-                        person_mask = detections.class_id == 0
-
-                        # Ball tracking with size filter + centroid-based outlier rejection
-                        ball_dets = detections[ball_mask]
-                        if len(ball_dets) > 0 and ball_dets.confidence is not None:
-                            # Filter by ball size — reject noise (too small) and non-ball (too large)
-                            bwidths = ball_dets.xyxy[:, 2] - ball_dets.xyxy[:, 0]
-                            bheights = ball_dets.xyxy[:, 3] - ball_dets.xyxy[:, 1]
-                            bsize_mask = (
-                                (bwidths >= BALL_MIN_SIZE_PX) & (bwidths <= BALL_MAX_SIZE_PX) &
-                                (bheights >= BALL_MIN_SIZE_PX) & (bheights <= BALL_MAX_SIZE_PX)
-                            )
-                            ball_dets = ball_dets[bsize_mask]
-                        if len(ball_dets) > 0 and ball_dets.confidence is not None:
-                            # Find the best ball detection
-                            centers = np.column_stack([
-                                (ball_dets.xyxy[:, 0] + ball_dets.xyxy[:, 2]) / 2,
-                                (ball_dets.xyxy[:, 1] + ball_dets.xyxy[:, 3]) / 2,
-                            ])
-
-                            if ball_history:
-                                # Compute centroid of recent ball positions
-                                centroid = np.mean(ball_history[-BALL_BUFFER_SIZE:], axis=0)
-                                # Pick detection closest to recent centroid
-                                dists = np.linalg.norm(centers - centroid, axis=1)
-                                best_ball_idx = int(np.argmin(dists))
-                                # Reject if too far from recent history (likely false positive)
-                                if dists[best_ball_idx] > BALL_MAX_JUMP_PX:
-                                    best_ball_idx = -1  # skip this frame
-                            else:
-                                # No history yet — take highest confidence
-                                best_ball_idx = int(np.argmax(ball_dets.confidence))
-
-                            if best_ball_idx >= 0:
-                                bx, by = float(centers[best_ball_idx][0]), float(centers[best_ball_idx][1])
-                                ball_positions[fidx] = (
-                                    bx, by,
-                                    float(ball_dets.confidence[best_ball_idx]),
-                                )
-                                ball_history.append([bx, by])
-                                if len(ball_history) > BALL_BUFFER_SIZE:
-                                    ball_history.pop(0)
-
-                        # Filter person detections back to higher confidence
-                        person_dets = detections[person_mask]
-                        if len(person_dets) > 0 and person_dets.confidence is not None:
-                            high_conf = person_dets.confidence >= 0.25
-                            detections = person_dets[high_conf]
-                        else:
-                            detections = person_dets
 
                     # Filter by bbox size and aspect ratio (players only)
                     if len(detections) > 0:
@@ -525,6 +529,15 @@ def process_video(video_url: str, field_template: str) -> dict:
                         # No detections — still update tracker with empty
                         tracker.update(np.empty((0, 6), dtype=np.float32), detection_batch[batch_i])
 
+                # --- Pass 2: Ball detection via SAHI tiled inference ---
+                for batch_i in range(len(detection_batch)):
+                    fidx = detection_batch_indices[batch_i]
+                    if fidx not in ball_positions:  # skip if already found by previous method
+                        ball_dets = detect_ball_sahi(detection_batch[batch_i])
+                        result = pick_best_ball(ball_dets, ball_history)
+                        if result is not None:
+                            ball_positions[fidx] = result
+
                 detection_batch = []
                 detection_batch_indices = []
 
@@ -535,50 +548,13 @@ def process_video(video_url: str, field_template: str) -> dict:
 
         frame_idx += 1
 
-    # Flush remaining detection batch
+    # Flush remaining detection batch (same two-pass approach)
     if detection_batch:
-        results = yolo_model(detection_batch, classes=[0, 32], conf=BALL_CONF_THRESHOLD, imgsz=1088, verbose=False)
+        # Pass 1: Players
+        results = yolo_model(detection_batch, classes=[0], conf=0.25, imgsz=1088, verbose=False)
         for batch_i, result in enumerate(results):
             fidx = detection_batch_indices[batch_i]
             detections = sv.Detections.from_ultralytics(result)
-
-            # Separate ball from person detections (same logic as main loop)
-            if len(detections) > 0 and detections.class_id is not None:
-                ball_mask = detections.class_id == 32
-                person_mask = detections.class_id == 0
-                ball_dets = detections[ball_mask]
-                if len(ball_dets) > 0 and ball_dets.confidence is not None:
-                    bwidths = ball_dets.xyxy[:, 2] - ball_dets.xyxy[:, 0]
-                    bheights = ball_dets.xyxy[:, 3] - ball_dets.xyxy[:, 1]
-                    bsize_mask = (
-                        (bwidths >= BALL_MIN_SIZE_PX) & (bwidths <= BALL_MAX_SIZE_PX) &
-                        (bheights >= BALL_MIN_SIZE_PX) & (bheights <= BALL_MAX_SIZE_PX)
-                    )
-                    ball_dets = ball_dets[bsize_mask]
-                if len(ball_dets) > 0 and ball_dets.confidence is not None:
-                    centers = np.column_stack([
-                        (ball_dets.xyxy[:, 0] + ball_dets.xyxy[:, 2]) / 2,
-                        (ball_dets.xyxy[:, 1] + ball_dets.xyxy[:, 3]) / 2,
-                    ])
-                    if ball_history:
-                        centroid = np.mean(ball_history[-BALL_BUFFER_SIZE:], axis=0)
-                        dists = np.linalg.norm(centers - centroid, axis=1)
-                        best_ball_idx = int(np.argmin(dists))
-                        if dists[best_ball_idx] > BALL_MAX_JUMP_PX:
-                            best_ball_idx = -1
-                    else:
-                        best_ball_idx = int(np.argmax(ball_dets.confidence))
-                    if best_ball_idx >= 0:
-                        bx, by = float(centers[best_ball_idx][0]), float(centers[best_ball_idx][1])
-                        ball_positions[fidx] = (bx, by, float(ball_dets.confidence[best_ball_idx]))
-                        ball_history.append([bx, by])
-
-                person_dets = detections[person_mask]
-                if len(person_dets) > 0 and person_dets.confidence is not None:
-                    detections = person_dets[person_dets.confidence >= 0.25]
-                else:
-                    detections = person_dets
-
             if len(detections) > 0:
                 heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
                 widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
@@ -595,6 +571,15 @@ def process_video(video_url: str, field_template: str) -> dict:
                 for track in tracks_output:
                     x1, y1, x2, y2, track_id, conf = track[0], track[1], track[2], track[3], int(track[4]), float(track[5])
                     frame_tracks[fidx][track_id] = ((x1 + x2) / 2, y2, conf)
+
+        # Pass 2: Ball via SAHI
+        for batch_i in range(len(detection_batch)):
+            fidx = detection_batch_indices[batch_i]
+            if fidx not in ball_positions:
+                ball_dets = detect_ball_sahi(detection_batch[batch_i])
+                result = pick_best_ball(ball_dets, ball_history)
+                if result is not None:
+                    ball_positions[fidx] = result
 
     cap.release()
     os.remove(transcoded_path)
