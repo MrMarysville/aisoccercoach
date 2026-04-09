@@ -44,8 +44,8 @@ image = (
         "mkdir -p /opt/PnLCalib/weights",
         "wget -q https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_kp -O /opt/PnLCalib/weights/SV_kp",
         "wget -q https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_lines -O /opt/PnLCalib/weights/SV_lines",
-        # Pre-download YOLO weights
-        'python -c "from ultralytics import YOLO; YOLO(\'yolo11n.pt\')"',
+        # Pre-download YOLO weights (YOLO26m for better accuracy + ball detection)
+        'python -c "from ultralytics import YOLO; YOLO(\'yolo26m.pt\')"',
         # Pre-download ReID weights for BoxMOT
         'python -c "from boxmot import BotSort; from pathlib import Path; BotSort(reid_weights=Path(\'osnet_x0_25_msmt17.pt\'), device=\'cpu\', half=False)"',
     ])
@@ -137,7 +137,7 @@ def process_video(video_url: str, field_template: str) -> dict:
         1. Download + transcode (FFmpeg H.265→H.264)
         2. ECC camera motion estimation (every frame)
         3. PnLCalib field calibration (every 30th frame)
-        4. YOLOv11n player detection (every 3rd frame, batch=8)
+        4. YOLO26m player+ball detection (every 3rd frame, batch=8, imgsz=1088)
         5. BoT-SORT tracking with CMC (every 3rd frame)
         6. K-Means team classification (post-processing)
         7. Homography coordinate transform (post-processing)
@@ -217,7 +217,7 @@ def process_video(video_url: str, field_template: str) -> dict:
     # -----------------------------------------------------------------------
     # Initialize models
     # -----------------------------------------------------------------------
-    yolo_model = YOLO("yolo11n.pt")
+    yolo_model = YOLO("yolo26m.pt")
     yolo_model.to("cuda")
 
     tracker = BotSort(
@@ -225,6 +225,7 @@ def process_video(video_url: str, field_template: str) -> dict:
         device=0,
         half=True,
         cmc_method="ecc",
+        track_buffer=60,  # ~2s at 30fps — covers most occlusions in soccer
     )
 
     # Try to load PnLCalib models (may fail if repo structure differs)
@@ -270,6 +271,9 @@ def process_video(video_url: str, field_template: str) -> dict:
 
     # Color samples for team classification: { track_id: [hsv_histograms] }
     color_samples = defaultdict(list)
+
+    # Ball positions: { frame_idx: (center_x_px, center_y_px, conf) }
+    ball_positions = {}
 
     # Motion scores for halftime detection
     motion_scores = []
@@ -413,12 +417,30 @@ def process_video(video_url: str, field_template: str) -> dict:
 
             # Process in batches of 8
             if len(detection_batch) >= 8:
-                results = yolo_model(detection_batch, classes=[0], conf=0.25, verbose=False)
+                results = yolo_model(detection_batch, classes=[0, 32], conf=0.25, imgsz=1088, verbose=False)
                 for batch_i, result in enumerate(results):
                     fidx = detection_batch_indices[batch_i]
                     detections = sv.Detections.from_ultralytics(result)
 
-                    # Filter by bbox size and aspect ratio
+                    # Separate ball detections (class 32) from person detections (class 0)
+                    if len(detections) > 0 and detections.class_id is not None:
+                        ball_mask = detections.class_id == 32
+                        person_mask = detections.class_id == 0
+
+                        # Store best ball detection for this frame
+                        ball_dets = detections[ball_mask]
+                        if len(ball_dets) > 0 and ball_dets.confidence is not None:
+                            best_ball_idx = int(np.argmax(ball_dets.confidence))
+                            bx1, by1, bx2, by2 = ball_dets.xyxy[best_ball_idx]
+                            ball_positions[fidx] = (
+                                float((bx1 + bx2) / 2),
+                                float((by1 + by2) / 2),
+                                float(ball_dets.confidence[best_ball_idx]),
+                            )
+
+                        detections = detections[person_mask]
+
+                    # Filter by bbox size and aspect ratio (players only)
                     if len(detections) > 0:
                         heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
                         widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
@@ -471,10 +493,26 @@ def process_video(video_url: str, field_template: str) -> dict:
 
     # Flush remaining detection batch
     if detection_batch:
-        results = yolo_model(detection_batch, classes=[0], conf=0.25, verbose=False)
+        results = yolo_model(detection_batch, classes=[0, 32], conf=0.25, imgsz=1088, verbose=False)
         for batch_i, result in enumerate(results):
             fidx = detection_batch_indices[batch_i]
             detections = sv.Detections.from_ultralytics(result)
+
+            # Separate ball from person detections
+            if len(detections) > 0 and detections.class_id is not None:
+                ball_mask = detections.class_id == 32
+                person_mask = detections.class_id == 0
+                ball_dets = detections[ball_mask]
+                if len(ball_dets) > 0 and ball_dets.confidence is not None:
+                    best_ball_idx = int(np.argmax(ball_dets.confidence))
+                    bx1, by1, bx2, by2 = ball_dets.xyxy[best_ball_idx]
+                    ball_positions[fidx] = (
+                        float((bx1 + bx2) / 2),
+                        float((by1 + by2) / 2),
+                        float(ball_dets.confidence[best_ball_idx]),
+                    )
+                detections = detections[person_mask]
+
             if len(detections) > 0:
                 heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
                 widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
@@ -588,6 +626,67 @@ def process_video(video_url: str, field_template: str) -> dict:
                 "confidence": round(float(effective_conf), 3),
             })
 
+    # -----------------------------------------------------------------------
+    # Ball coordinate transform (post-processing)
+    # -----------------------------------------------------------------------
+    ball_output = []
+    for fidx in sorted(ball_positions.keys()):
+        t_sec = fidx / fps
+        bx_px, by_px, bconf = ball_positions[fidx]
+        H = frame_H.get(fidx)
+
+        if H is not None:
+            field_x, field_y = apply_homography(H, bx_px, by_px)
+            if field_x is None:
+                continue
+            field_x = max(0, min(FIELD_W, field_x))
+            field_y = max(0, min(FIELD_H, field_y))
+            if not point_in_field(field_x, field_y):
+                continue
+        else:
+            field_x = (bx_px / width) * FIELD_W
+            field_y = (by_px / height) * FIELD_H
+            bconf *= 0.3
+
+        ball_output.append({
+            "frame": fidx,
+            "time": round(t_sec, 3),
+            "x": round(float(field_x), 2),
+            "y": round(float(field_y), 2),
+            "confidence": round(float(bconf), 3),
+            "interpolated": False,
+        })
+
+    # -----------------------------------------------------------------------
+    # Ball trajectory interpolation (fill gaps < 1 second)
+    # -----------------------------------------------------------------------
+    MAX_INTERP_GAP = int(fps)  # 1 second — safe for continuous play
+    if len(ball_output) >= 2:
+        interpolated_ball = [ball_output[0]]
+        for i in range(1, len(ball_output)):
+            prev = ball_output[i - 1]
+            curr = ball_output[i]
+            gap_frames = curr["frame"] - prev["frame"]
+
+            if gap_frames > DETECTION_INTERVAL and gap_frames <= MAX_INTERP_GAP:
+                # Linear interpolation for short gaps
+                for f in range(prev["frame"] + DETECTION_INTERVAL,
+                               curr["frame"], DETECTION_INTERVAL):
+                    alpha = (f - prev["frame"]) / gap_frames
+                    interpolated_ball.append({
+                        "frame": f,
+                        "time": round(f / fps, 3),
+                        "x": round(prev["x"] + alpha * (curr["x"] - prev["x"]), 2),
+                        "y": round(prev["y"] + alpha * (curr["y"] - prev["y"]), 2),
+                        "confidence": round(
+                            min(prev["confidence"], curr["confidence"]) * 0.7, 3),
+                        "interpolated": True,
+                    })
+
+            interpolated_ball.append(curr)
+
+        ball_output = interpolated_ball
+
     update_progress("transform", 92)
 
     # -----------------------------------------------------------------------
@@ -655,6 +754,9 @@ def process_video(video_url: str, field_template: str) -> dict:
             "field_template": field_template,
             "periods": periods,
             "processing_time_seconds": round(processing_time, 1),
+            "detector_model": "yolo26m",
+            "imgsz": 1088,
         },
         "tracks": tracks_list,
+        "ball": ball_output,
     }

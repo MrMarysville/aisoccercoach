@@ -1,6 +1,16 @@
 export interface ProcessingResult {
   metadata: ProcessingMetadata;
   tracks: Track[];
+  ball?: BallPosition[];
+}
+
+export interface BallPosition {
+  frame: number;
+  time: number;
+  x: number;
+  y: number;
+  confidence: number;
+  interpolated?: boolean;
 }
 
 export interface ProcessingMetadata {
@@ -9,9 +19,11 @@ export interface ProcessingMetadata {
   detection_fps: number;
   duration: number;
   frame_count: number;
-  field_template: '9v9';
+  field_template: '9v9' | '11v11';
   periods: Period[];
   processing_time_seconds: number;
+  detector_model?: string;
+  imgsz?: number;
 }
 
 export interface Period {
@@ -44,7 +56,7 @@ export interface JobStatus {
 
 export interface ProcessRequest {
   video_id: string;
-  field_template: '9v9';
+  field_template: '9v9' | '11v11';
 }
 
 export interface ProcessJobResponse {

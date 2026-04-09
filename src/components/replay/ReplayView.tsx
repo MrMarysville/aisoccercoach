@@ -75,7 +75,7 @@ export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayView
         <div className="flex flex-col gap-2">
           <h2 className="text-lg font-semibold text-on-surface">Tactical Board</h2>
           {isVideoReady ? (
-            <TacticalCanvas tracks={result.tracks} videoRef={videoRef} />
+            <TacticalCanvas tracks={result.tracks} ball={result.ball} videoRef={videoRef} />
           ) : (
             <div
               className="card flex items-center justify-center"
@@ -113,6 +113,13 @@ export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayView
             style={{ backgroundColor: '#eab308' }}
           />
           <span className="text-on-surface-secondary">Referee</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span
+            className="w-3 h-3 rounded-full"
+            style={{ backgroundColor: '#ffffff', border: '2px solid #000000' }}
+          />
+          <span className="text-on-surface-secondary">Ball</span>
         </div>
       </div>
     </div>

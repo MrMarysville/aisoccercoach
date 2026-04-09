@@ -1,4 +1,4 @@
-import type { Keyframe } from '@/types/replay';
+import type { Keyframe, BallPosition } from '@/types/replay';
 
 const FADE_DURATION = 0.5;
 const LOW_CONFIDENCE_THRESHOLD = 0.5;
@@ -106,6 +106,76 @@ export function interpolatePosition(
   const alpha = (t - prev.time) / (next.time - prev.time);
   const confidence = Math.min(prev.confidence, next.confidence);
   const opacity = confidence < LOW_CONFIDENCE_THRESHOLD ? LOW_CONFIDENCE_OPACITY : 1;
+
+  return {
+    x: lerp(prev.x, next.x, alpha),
+    y: lerp(prev.y, next.y, alpha),
+    opacity,
+  };
+}
+
+/**
+ * Interpolate ball position at time `t` from an array of BallPosition entries.
+ *
+ * Reuses the same binary-search + lerp approach as player interpolation.
+ * Ball positions fade out faster (0.3s) since the ball moves quickly and
+ * stale positions are misleading.
+ *
+ * @param positions - Sorted array of ball positions (ascending by time)
+ * @param t - Query time in seconds
+ */
+export function interpolateBallPosition(
+  positions: BallPosition[],
+  t: number
+): InterpolatedPosition | null {
+  if (positions.length === 0) return null;
+
+  const first = positions[0];
+  const last = positions[positions.length - 1];
+
+  if (first === undefined || last === undefined) return null;
+
+  // Before first detection — don't show
+  if (t < first.time) return null;
+
+  // After last detection — fade quickly (0.3s)
+  if (t >= last.time) {
+    const elapsed = t - last.time;
+    if (elapsed >= 0.3) return null;
+    return { x: last.x, y: last.y, opacity: Math.max(0, 1 - elapsed / 0.3) };
+  }
+
+  // Binary search for bracket
+  let lo = 0;
+  let hi = positions.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >>> 1;
+    const midPos = positions[mid];
+    if (midPos !== undefined && midPos.time <= t) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+
+  const prev = positions[lo];
+  const next = positions[hi];
+
+  if (prev === undefined || next === undefined) return null;
+
+  const gap = next.time - prev.time;
+
+  // If gap is zero or too large (>2s), don't interpolate — ball likely out of play
+  if (gap <= 0 || gap > 2.0) {
+    const elapsed = t - prev.time;
+    if (elapsed >= 0.3) return null;
+    return { x: prev.x, y: prev.y, opacity: Math.max(0, 1 - elapsed / 0.3) };
+  }
+
+  const alpha = (t - prev.time) / gap;
+  const confidence = Math.min(prev.confidence, next.confidence);
+  const isInterpolated = prev.interpolated === true || next.interpolated === true;
+  const opacity = isInterpolated ? 0.7 : (confidence < LOW_CONFIDENCE_THRESHOLD ? 0.6 : 1);
 
   return {
     x: lerp(prev.x, next.x, alpha),
