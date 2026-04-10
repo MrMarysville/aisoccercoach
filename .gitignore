@@ -41,3 +41,12 @@ yarn-error.log*
 next-env.d.ts
 .remember/
 .env*.local
+
+# local CV / benchmarking artifacts
+.cache/
+__pycache__/
+.venv-local/
+benchmark-results/
+test-clips/*.mp4
+trace-1080p.mp4
+*.pt

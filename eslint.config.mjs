@@ -12,6 +12,10 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    ".venv-local/**",
+    ".cache/**",
+    "benchmark-results/**",
+    "test-clips/**/*.mp4",
   ]),
 ]);
 

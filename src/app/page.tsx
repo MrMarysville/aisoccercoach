@@ -3,7 +3,7 @@
 import { useState, useCallback } from 'react';
 import VideoUploader from '@/components/video/VideoUploader';
 import ReplayView from '@/components/replay/ReplayView';
-import type { ProcessingResult, ProcessJobResponse } from '@/types/replay';
+import type { CachedProcessResponse, ProcessingResult, ProcessJobResponse } from '@/types/replay';
 
 type Tab = 'upload' | 'replay';
 
@@ -19,6 +19,8 @@ export default function Home() {
     setVideoSrc(blobUrl);
     setActiveTab('replay');
     setSubmitError(null);
+    setCachedResult(null);
+    setJobId(null);
 
     try {
       const response = await fetch('/api/process', {
@@ -33,15 +35,15 @@ export default function Home() {
         return;
       }
 
-      const data: Record<string, unknown> = await response.json();
+      const data = await response.json() as ProcessJobResponse | CachedProcessResponse;
 
-      if (data.cached && typeof data.result_url === 'string') {
+      if ('cached' in data && data.cached) {
         const resultResponse = await fetch(data.result_url);
         const result: ProcessingResult = await resultResponse.json();
         setCachedResult(result);
-      } else {
-        const jobResponse = data as unknown as ProcessJobResponse;
-        setJobId(jobResponse.job_id);
+        setJobId(null);
+      } else if ('job_id' in data) {
+        setJobId(data.job_id);
       }
     } catch {
       setSubmitError('Failed to connect to server. Please try again.');

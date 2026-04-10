@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getResult } from '@/lib/modal-client';
+import { cacheProcessingResult } from '@/lib/result-cache';
 
 export async function GET(
   _request: NextRequest,
@@ -14,6 +15,7 @@ export async function GET(
       return NextResponse.json({ status: 'processing' }, { status: 202 });
     }
 
+    void cacheProcessingResult(result).catch(() => undefined);
     return NextResponse.json(result);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Result fetch failed';

@@ -7,10 +7,16 @@ vi.mock('@/lib/modal-client', () => ({
   getResult: vi.fn(),
 }));
 
+vi.mock('@/lib/result-cache', () => ({
+  findCachedResultUrl: vi.fn(),
+  cacheProcessingResult: vi.fn(),
+}));
+
 import { POST } from '@/app/api/process/route';
 import { GET as getStatus } from '@/app/api/process/status/[jobId]/route';
 import { GET as getResult } from '@/app/api/process/result/[jobId]/route';
 import { submitJob, pollStatus, getResult as getResultFn } from '@/lib/modal-client';
+import { findCachedResultUrl, cacheProcessingResult } from '@/lib/result-cache';
 import { NextRequest } from 'next/server';
 import type { ProcessingResult } from '@/types/replay';
 
@@ -37,6 +43,8 @@ function createGetRequest(url: string): NextRequest {
 describe('POST /api/process', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(findCachedResultUrl).mockResolvedValue(null);
+    vi.mocked(cacheProcessingResult).mockResolvedValue(null);
   });
 
   it('returns 400 when video_url is missing', async () => {
@@ -74,6 +82,22 @@ describe('POST /api/process', () => {
     const data = await response.json() as { job_id: string };
     expect(data.job_id).toBe('fc-job-456');
     expect(submitJob).toHaveBeenCalledWith('https://blob.vercel-storage.com/v.mp4', '9v9');
+  });
+
+  it('returns cached result URL when a cached blob exists', async () => {
+    vi.mocked(findCachedResultUrl).mockResolvedValue('https://blob.vercel-storage.com/results/test-123.json');
+
+    const request = createPostRequest({
+      video_url: 'https://blob.vercel-storage.com/v.mp4',
+      video_id: 'test-123',
+    });
+    const response = await POST(request);
+    expect(response.status).toBe(200);
+
+    const data = await response.json() as { cached: true; result_url: string };
+    expect(data.cached).toBe(true);
+    expect(data.result_url).toContain('results/test-123.json');
+    expect(submitJob).not.toHaveBeenCalled();
   });
 
   it('passes video_url and hardcoded 9v9 template to submitJob', async () => {
@@ -157,15 +181,41 @@ describe('GET /api/process/status/[jobId]', () => {
     vi.mocked(pollStatus).mockResolvedValue({
       status: 'failed',
       error: 'GPU OOM',
+      failure_code: 'CALIBRATION_BOOTSTRAP_FAILED',
+      calibration: {
+        status: 'failed',
+        failure_code: 'CALIBRATION_BOOTSTRAP_FAILED',
+        failure_message: 'No valid field anchor found in first 15 seconds',
+        accepted_anchor_count: 0,
+        rejected_anchor_count: 5,
+        coverage_ratio: 0,
+        longest_gap_seconds: 15,
+        median_anchor_line_iou: null,
+        median_temporal_consistency_px: null,
+        max_temporal_consistency_px: null,
+        median_landmark_jitter_px: null,
+        debug_artifact_path: '/tmp/calibration_debug.mp4',
+        preview_frames: [
+          {
+            frame: 0,
+            time: 0,
+            label: 'invalid',
+            source: 'invalid',
+            data_url: 'data:image/jpeg;base64,abc',
+          },
+        ],
+      },
     });
 
     const request = createGetRequest('http://localhost:3000/api/process/status/fc-fail');
     const params = Promise.resolve({ jobId: 'fc-fail' });
     const response = await getStatus(request, { params });
-    const data = await response.json() as { status: string; error: string };
+    const data = await response.json() as { status: string; error: string; failure_code?: string; calibration?: { preview_frames?: unknown[] } };
 
     expect(data.status).toBe('failed');
     expect(data.error).toBe('GPU OOM');
+    expect(data.failure_code).toBe('CALIBRATION_BOOTSTRAP_FAILED');
+    expect(data.calibration?.preview_frames).toHaveLength(1);
   });
 
   it('returns 500 when pollStatus throws', async () => {
@@ -200,6 +250,7 @@ describe('GET /api/process/status/[jobId]', () => {
 describe('GET /api/process/result/[jobId]', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(cacheProcessingResult).mockResolvedValue(null);
   });
 
   it('returns 202 when result is null (still processing)', async () => {
@@ -233,6 +284,18 @@ describe('GET /api/process/result/[jobId]', () => {
         field_template: '9v9',
         periods: [],
         processing_time_seconds: 300,
+        calibration: {
+          status: 'passed',
+          accepted_anchor_count: 120,
+          rejected_anchor_count: 8,
+          coverage_ratio: 0.94,
+          longest_gap_seconds: 0.9,
+          median_anchor_line_iou: 0.29,
+          median_temporal_consistency_px: 17.5,
+          max_temporal_consistency_px: 55.1,
+          median_landmark_jitter_px: 8.2,
+          debug_artifact_path: '/tmp/calibration_debug.mp4',
+        },
       },
       tracks: [],
     };
@@ -247,7 +310,9 @@ describe('GET /api/process/result/[jobId]', () => {
     expect(data.metadata.video_id).toBe('v1');
     expect(data.metadata.fps).toBe(30);
     expect(data.metadata.field_template).toBe('9v9');
+    expect(data.metadata.calibration?.status).toBe('passed');
     expect(data.tracks).toEqual([]);
+    expect(cacheProcessingResult).toHaveBeenCalledWith(mockResult);
   });
 
   it('passes jobId param to getResult', async () => {
@@ -297,6 +362,32 @@ describe('GET /api/process/result/[jobId]', () => {
     expect(data.tracks).toHaveLength(2);
     expect(data.tracks[0]?.player_id).toBe('p1');
     expect(data.tracks[1]?.team).toBe('away');
+  });
+
+  it('still returns result when cache write fails', async () => {
+    const mockResult: ProcessingResult = {
+      metadata: {
+        video_id: 'v-cache',
+        fps: 25,
+        detection_fps: 5,
+        duration: 90,
+        frame_count: 2250,
+        field_template: '9v9',
+        periods: [{ start_time: 0, end_time: 45 }],
+        processing_time_seconds: 60,
+      },
+      tracks: [],
+    };
+    vi.mocked(getResultFn).mockResolvedValue(mockResult);
+    vi.mocked(cacheProcessingResult).mockRejectedValue(new Error('cache failed'));
+
+    const request = createGetRequest('http://localhost:3000/api/process/result/fc-cache');
+    const params = Promise.resolve({ jobId: 'fc-cache' });
+    const response = await getResult(request, { params });
+    expect(response.status).toBe(200);
+
+    const data = await response.json() as ProcessingResult;
+    expect(data.metadata.video_id).toBe('v-cache');
   });
 
   it('returns 500 when getResult throws', async () => {

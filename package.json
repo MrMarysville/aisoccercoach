@@ -8,7 +8,14 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "calibration:poll": "node scripts/poll-calibration.mjs",
+    "calibration:watch": "node scripts/watch-calibration-call.mjs",
+    "calibration:upload": "node scripts/upload-clip.mjs",
+    "calibration:benchmark": "node scripts/run-calibration-benchmark.mjs",
+    "calibration:local": ".venv-local/bin/python scripts/run-local-process.py",
+    "calibration:benchmark:local": "node scripts/run-local-calibration-benchmark.mjs",
+    "calibration:compare": "node scripts/compare-calibration-results.mjs"
   },
   "dependencies": {
     "@vercel/blob": "^2.3.3",

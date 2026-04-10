@@ -6,14 +6,17 @@ import type { JobStatus } from '@/types/replay';
 interface ProcessingStatusProps {
   jobId: string;
   onComplete: () => void;
-  onError: (error: string) => void;
+  onError: (error: JobStatus) => void;
 }
 
 const STAGE_LABELS: Record<string, string> = {
   starting: 'Starting...',
   transcoding: 'Transcoding video',
+  field_evidence: 'Extracting field evidence',
   camera_motion: 'Analyzing camera motion',
   field_calibration: 'Detecting field lines',
+  calibration_validation: 'Validating calibration',
+  calibration_debug: 'Rendering calibration debug',
   detection: 'Detecting players & ball',
   tracking: 'Tracking players',
   classification: 'Classifying teams',
@@ -57,7 +60,10 @@ export default function ProcessingStatus({
   const poll = useCallback(async () => {
     // Check timeout
     if (startTimeRef.current > 0 && Date.now() - startTimeRef.current > PROCESSING_TIMEOUT) {
-      onError('Processing timed out after 30 minutes. The video may be too long or the server may be overloaded.');
+      onError({
+        status: 'failed',
+        error: 'Processing timed out after 30 minutes. The video may be too long or the server may be overloaded.',
+      });
       return;
     }
 
@@ -68,7 +74,10 @@ export default function ProcessingStatus({
         setConsecutiveFailures(prev => {
           const next = prev + 1;
           if (next >= MAX_CONSECUTIVE_FAILURES) {
-            onError(`Lost connection to server (${response.status}). Please refresh and try again.`);
+            onError({
+              status: 'failed',
+              error: `Lost connection to server (${response.status}). Please refresh and try again.`,
+            });
           }
           return next;
         });
@@ -80,12 +89,20 @@ export default function ProcessingStatus({
       setStatus(data);
 
       if (data.status === 'complete') onComplete();
-      if (data.status === 'failed') onError(data.error ?? 'Processing failed');
+      if (data.status === 'failed') {
+        onError({
+          ...data,
+          error: data.error ?? 'Processing failed',
+        });
+      }
     } catch {
       setConsecutiveFailures(prev => {
         const next = prev + 1;
         if (next >= MAX_CONSECUTIVE_FAILURES) {
-          onError('Lost connection to server. Please check your internet and try again.');
+          onError({
+            status: 'failed',
+            error: 'Lost connection to server. Please check your internet and try again.',
+          });
         }
         return next;
       });

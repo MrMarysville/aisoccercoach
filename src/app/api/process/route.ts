@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { submitJob } from '@/lib/modal-client';
+import { findCachedResultUrl } from '@/lib/result-cache';
 import type { ProcessJobResponse } from '@/types/replay';
 
 export async function POST(request: NextRequest) {
@@ -9,6 +10,11 @@ export async function POST(request: NextRequest) {
 
     if (!video_url || !video_id) {
       return NextResponse.json({ error: 'video_url and video_id required' }, { status: 400 });
+    }
+
+    const cachedResultUrl = await findCachedResultUrl(video_id);
+    if (cachedResultUrl) {
+      return NextResponse.json({ cached: true, result_url: cachedResultUrl });
     }
 
     // video_url is a public Vercel Blob URL — Modal can download it directly

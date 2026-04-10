@@ -1,7 +1,8 @@
 'use client';
 
 import { useRef, useState, useCallback } from 'react';
-import type { ProcessingResult } from '@/types/replay';
+import Image from 'next/image';
+import type { JobStatus, ProcessingResult } from '@/types/replay';
 import TacticalCanvas from '@/components/replay/TacticalCanvas';
 import TimelineControl from '@/components/replay/TimelineControl';
 import ProcessingStatus from '@/components/replay/ProcessingStatus';
@@ -15,7 +16,7 @@ interface ReplayViewProps {
 export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [result, setResult] = useState<ProcessingResult | null>(cachedResult);
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<JobStatus | null>(null);
   const [isVideoReady, setIsVideoReady] = useState(false);
 
   const handleProcessingComplete = useCallback(async () => {
@@ -25,28 +26,89 @@ export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayView
       if (response.ok) {
         const data: ProcessingResult = await response.json();
         if (!data.tracks || data.tracks.length === 0) {
-          setError('Processing completed but no players were detected. Try a different video with visible players on a field.');
+          setFailure({
+            status: 'failed',
+            error: 'Processing completed but no players were detected. Try a different video with visible players on a field.',
+            calibration: data.metadata.calibration,
+          });
           return;
         }
+        setFailure(null);
         setResult(data);
       } else if (response.status === 202) {
         // Still processing — this shouldn't happen but handle it
-        setError('Results not ready yet. Please wait and try again.');
+        setFailure({ status: 'failed', error: 'Results not ready yet. Please wait and try again.' });
       } else {
-        const err = await response.json().catch(() => ({ error: 'Unknown error' }));
-        setError((err as { error?: string }).error ?? `Failed to load results (${response.status})`);
+        const err = await response.json().catch(() => ({ error: 'Unknown error' })) as JobStatus;
+        setFailure({
+          status: 'failed',
+          error: err.error ?? `Failed to load results (${response.status})`,
+          failure_code: err.failure_code,
+          calibration: err.calibration,
+        });
       }
     } catch {
-      setError('Failed to load results. Please check your connection and try again.');
+      setFailure({ status: 'failed', error: 'Failed to load results. Please check your connection and try again.' });
     }
   }, [jobId]);
 
   if (!result && jobId) {
-    if (error) {
+    if (failure) {
+      const calibration = failure.calibration;
       return (
-        <div className="card p-12 flex flex-col items-center gap-4">
-          <p className="text-error font-medium">{error}</p>
-          <button onClick={() => setError(null)} className="btn btn-primary">
+        <div className="card p-8 flex flex-col gap-5">
+          <div className="flex flex-col gap-1">
+            <p className="text-error font-medium">{failure.error}</p>
+            {failure.failure_code && (
+              <p className="text-xs text-on-surface-secondary">Failure code: {failure.failure_code}</p>
+            )}
+          </div>
+
+          {calibration && (
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+              <div className="card p-3">
+                <p className="text-on-surface-secondary">Coverage</p>
+                <p className="text-on-surface font-medium">{Math.round(calibration.coverage_ratio * 100)}%</p>
+              </div>
+              <div className="card p-3">
+                <p className="text-on-surface-secondary">Longest Gap</p>
+                <p className="text-on-surface font-medium">{calibration.longest_gap_seconds}s</p>
+              </div>
+              <div className="card p-3">
+                <p className="text-on-surface-secondary">Line IoU</p>
+                <p className="text-on-surface font-medium">{calibration.median_anchor_line_iou ?? 'n/a'}</p>
+              </div>
+              <div className="card p-3">
+                <p className="text-on-surface-secondary">Jitter</p>
+                <p className="text-on-surface font-medium">{calibration.median_landmark_jitter_px ?? 'n/a'}px</p>
+              </div>
+            </div>
+          )}
+
+          {calibration?.preview_frames && calibration.preview_frames.length > 0 && (
+            <div className="flex flex-col gap-3">
+              <p className="text-sm font-medium text-on-surface">Calibration Preview Frames</p>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {calibration.preview_frames.map((preview) => (
+                  <div key={`${preview.frame}-${preview.time}`} className="card p-3 flex flex-col gap-2">
+                    <Image
+                      src={preview.data_url}
+                      alt={`Calibration preview frame ${preview.frame}`}
+                      width={640}
+                      height={360}
+                      unoptimized
+                      className="w-full h-auto rounded-md"
+                    />
+                    <p className="text-xs text-on-surface-secondary">
+                      Frame {preview.frame} at {preview.time}s · {preview.source}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button onClick={() => setFailure(null)} className="btn btn-primary self-start">
             Retry
           </button>
         </div>
@@ -56,7 +118,7 @@ export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayView
       <ProcessingStatus
         jobId={jobId}
         onComplete={handleProcessingComplete}
-        onError={setError}
+        onError={setFailure}
       />
     );
   }
@@ -103,6 +165,56 @@ export default function ReplayView({ videoSrc, jobId, cachedResult }: ReplayView
           detectionFps={result.metadata.detection_fps}
           duration={result.metadata.duration}
         />
+      )}
+
+      {result.metadata.calibration && (
+        <div className="card p-4 flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-on-surface">Calibration Check</h3>
+            <span className="text-xs text-on-surface-secondary">
+              {result.metadata.calibration.status === 'passed' ? 'Passed' : 'Failed'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+            <div className="card p-3">
+              <p className="text-on-surface-secondary">Coverage</p>
+              <p className="text-on-surface font-medium">{Math.round(result.metadata.calibration.coverage_ratio * 100)}%</p>
+            </div>
+            <div className="card p-3">
+              <p className="text-on-surface-secondary">Longest Gap</p>
+              <p className="text-on-surface font-medium">{result.metadata.calibration.longest_gap_seconds}s</p>
+            </div>
+            <div className="card p-3">
+              <p className="text-on-surface-secondary">Line IoU</p>
+              <p className="text-on-surface font-medium">{result.metadata.calibration.median_anchor_line_iou ?? 'n/a'}</p>
+            </div>
+            <div className="card p-3">
+              <p className="text-on-surface-secondary">Jitter</p>
+              <p className="text-on-surface font-medium">{result.metadata.calibration.median_landmark_jitter_px ?? 'n/a'}px</p>
+            </div>
+          </div>
+
+          {result.metadata.calibration.preview_frames && result.metadata.calibration.preview_frames.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {result.metadata.calibration.preview_frames.map((preview) => (
+                <div key={`${preview.frame}-${preview.time}`} className="card p-3 flex flex-col gap-2">
+                  <Image
+                    src={preview.data_url}
+                    alt={`Calibration preview frame ${preview.frame}`}
+                    width={640}
+                    height={360}
+                    unoptimized
+                    className="w-full h-auto rounded-md"
+                  />
+                  <p className="text-xs text-on-surface-secondary">
+                    Frame {preview.frame} at {preview.time}s · {preview.source}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       <div className="flex gap-4 text-xs p-3 card">
