@@ -9,6 +9,15 @@ from collections import defaultdict
 from pathlib import Path
 
 
+def write_status_file(status_path, payload: dict) -> None:
+    if status_path is None:
+        return
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = status_path.with_suffix(status_path.suffix + '.tmp')
+    tmp_path.write_text(json.dumps(payload, indent=2) + '\n')
+    tmp_path.replace(status_path)
+
+
 def load_env_file_if_present(repo_root: Path) -> None:
     env_path = repo_root / ".env.local"
     if not env_path.exists():
@@ -24,13 +33,15 @@ def load_env_file_if_present(repo_root: Path) -> None:
 
 
 class LocalProgressDict:
-    def __init__(self) -> None:
+    def __init__(self, status_path=None) -> None:
         self._last = None
+        self._status_path = status_path
 
     def put(self, _call_id: str, payload: dict) -> None:
         line = json.dumps(payload, sort_keys=True)
         if line != self._last:
             print(f"[local-progress] {line}", flush=True)
+            write_status_file(self._status_path, payload)
             self._last = line
 
 
@@ -45,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run full process pipeline or calibration-only",
     )
     parser.add_argument("--output", help="Write JSON result to this file")
+    parser.add_argument(
+        "--status-file",
+        help="Write machine-readable status JSON to this file (defaults to <output>.status.json when --output is set)",
+    )
     parser.add_argument(
         "--pnlcalib-root",
         default=str(Path("/root/aisoccercoach/.cache/PnLCalib")),
@@ -78,92 +93,133 @@ def main() -> int:
 
     import modal_app
 
-    progress = LocalProgressDict()
+    output_path = Path(args.output) if args.output else None
+    status_path = Path(args.status_file) if args.status_file else (
+        Path(f"{args.output}.status.json") if args.output else None
+    )
+
+    progress = LocalProgressDict(status_path)
     call_id = "local-gpu"
     started = time.time()
+    write_status_file(
+        status_path,
+        {
+            "status": "processing",
+            "stage": "starting",
+            "percent": 0,
+            "video_path": args.video_path,
+            "mode": args.mode,
+            "field_template": args.field_template,
+            "started_at": time.time(),
+        },
+    )
 
     output = None
     exit_code = 0
     try:
-        if args.mode == "calibration":
-            video_info = modal_app._download_and_transcode_video(
-                args.video_path,
-                lambda stage, percent, **extras: progress.put(call_id, {
-                    "status": "processing",
-                    "stage": stage,
-                    "percent": percent,
-                    **extras,
-                }),
-                requests,
-                subprocess,
-                os,
-                cv2,
-            )
-            try:
-                result = modal_app.run_calibration_stage(
-                    transcoded_path=video_info["transcoded_path"],
-                    field_template=args.field_template,
-                    call_id=call_id,
-                    update_progress=lambda stage, percent, **extras: progress.put(call_id, {
+        try:
+            if args.mode == "calibration":
+                video_info = modal_app._download_and_transcode_video(
+                    args.video_path,
+                    lambda stage, percent, **extras: progress.put(call_id, {
                         "status": "processing",
                         "stage": stage,
                         "percent": percent,
                         **extras,
                     }),
-                    cv2=cv2,
-                    np=np,
+                    requests,
+                    subprocess,
+                    os,
+                    cv2,
                 )
-                output = {
-                    "metadata": {
-                        "fps": round(video_info["fps"], 2),
-                        "duration": round(video_info["duration"], 2),
-                        "frame_count": video_info["total_frames"],
-                        "processing_time_seconds": round(time.time() - started, 1),
-                    },
-                    "calibration": result.summary,
-                }
-            finally:
-                if os.path.exists(video_info["transcoded_path"]):
-                    os.remove(video_info["transcoded_path"])
-        else:
-            output = modal_app._process_video_impl(
-                args.video_path,
-                args.field_template,
-                started,
-                call_id,
-                progress,
-                subprocess,
-                os,
-                __import__("random"),
-                requests,
-                cv2,
-                np,
-                Path,
-                defaultdict,
-                YOLO,
-                BotSort,
-                KMeans,
-                sv,
-            )
-    except modal_app.CalibrationFailureError as error:
-        exit_code = 2
+                try:
+                    result = modal_app.run_calibration_stage(
+                        transcoded_path=video_info["transcoded_path"],
+                        field_template=args.field_template,
+                        call_id=call_id,
+                        update_progress=lambda stage, percent, **extras: progress.put(call_id, {
+                            "status": "processing",
+                            "stage": stage,
+                            "percent": percent,
+                            **extras,
+                        }),
+                        cv2=cv2,
+                        np=np,
+                    )
+                    output = {
+                        "metadata": {
+                            "fps": round(video_info["fps"], 2),
+                            "duration": round(video_info["duration"], 2),
+                            "frame_count": video_info["total_frames"],
+                            "processing_time_seconds": round(time.time() - started, 1),
+                        },
+                        "calibration": result.summary,
+                    }
+                finally:
+                    if os.path.exists(video_info["transcoded_path"]):
+                        os.remove(video_info["transcoded_path"])
+            else:
+                output = modal_app._process_video_impl(
+                    args.video_path,
+                    args.field_template,
+                    started,
+                    call_id,
+                    progress,
+                    subprocess,
+                    os,
+                    __import__("random"),
+                    requests,
+                    cv2,
+                    np,
+                    Path,
+                    defaultdict,
+                    YOLO,
+                    BotSort,
+                    KMeans,
+                    sv,
+                )
+        except modal_app.CalibrationFailureError as error:
+            exit_code = 2
+            output = {
+                "metadata": {
+                    "field_template": args.field_template,
+                    "processing_time_seconds": round(time.time() - started, 1),
+                },
+                "calibration": error.summary,
+                "error": str(error),
+                "failure_code": error.code,
+            }
+    except Exception as error:
+        exit_code = 1
         output = {
             "metadata": {
                 "field_template": args.field_template,
                 "processing_time_seconds": round(time.time() - started, 1),
             },
-            "calibration": error.summary,
             "error": str(error),
-            "failure_code": error.code,
+            "failure_code": "LOCAL_RUNNER_EXCEPTION",
         }
 
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(output, indent=2) + "\n")
-        print(f"[local-output] wrote {out_path}")
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(output, indent=2) + "\n")
+        print(f"[local-output] wrote {output_path}")
 
     print(json.dumps(output, indent=2)[:20000])
+    final_status = {
+        "status": "failed" if exit_code else "complete",
+        "stage": "done",
+        "percent": 100,
+        "video_path": args.video_path,
+        "mode": args.mode,
+        "field_template": args.field_template,
+        "exit_code": exit_code,
+        "duration_seconds": round(time.time() - started, 1),
+        "output_path": None if output_path is None else str(output_path),
+        "failure_code": None if output is None else output.get("failure_code") or output.get("calibration", {}).get("failure_code"),
+    }
+    write_status_file(status_path, final_status)
+    print(f"[local-final] {json.dumps(final_status, sort_keys=True)}", flush=True)
     return exit_code
 
 

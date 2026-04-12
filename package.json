@@ -15,7 +15,9 @@
     "calibration:benchmark": "node scripts/run-calibration-benchmark.mjs",
     "calibration:local": ".venv-local/bin/python scripts/run-local-process.py",
     "calibration:benchmark:local": "node scripts/run-local-calibration-benchmark.mjs",
-    "calibration:compare": "node scripts/compare-calibration-results.mjs"
+    "process:benchmark:local": "node scripts/run-local-process-benchmark.mjs",
+    "calibration:compare": "node scripts/compare-calibration-results.mjs",
+    "calibration:watch:local": "node scripts/watch-local-status.mjs"
   },
   "dependencies": {
     "@vercel/blob": "^2.3.3",

@@ -52,6 +52,8 @@ Reference manifest:
 12. Calibration progress reporting now emits on each anchor attempt, not just coarse frame milestones.
 13. A local clip uploader script now exists: `pnpm calibration:upload <local_path>`.
 14. A reusable calibration benchmark runner now exists: `pnpm calibration:benchmark [suite] [field_template]`.
+15. A local calibration benchmark runner now exists: `pnpm calibration:benchmark:local [suite] [field_template]`.
+16. A local full-process benchmark runner now exists: `pnpm process:benchmark:local [suite] [field_template]`.
 
 ## Current Code Intent
 
@@ -116,12 +118,68 @@ Interpretation:
 
 - local `RTX 2070 SUPER` is available and CUDA works
 - default iteration path should now be local first
+- local runner now writes a sidecar status file when `--output` is used:
+  - `<output>.status.json`
+- local runner also emits a final sentinel line:
+  - `[local-final] {...}`
 - useful commands:
   - `pnpm calibration:local <video_path> --mode calibration`
   - `pnpm calibration:local <video_path> --mode process`
   - `pnpm calibration:benchmark:local --list`
   - `pnpm calibration:benchmark:local smoke`
+  - `pnpm process:benchmark:local --list`
+  - `pnpm process:benchmark:local smoke`
 - keep Modal for final proof and app-path verification, not day-to-day tuning
+
+## Current Local Benchmark Baseline
+
+Calibration benchmark baseline from `benchmark-results/local-calibration/2026-04-10T20-39-49_core.json`:
+
+- `easy-wide`: passed
+- `kickoff-20s`: passed
+- `partial-45s`: passed
+- `zoom-fail`: failed with `CALIBRATION_BOOTSTRAP_WEAK`
+
+Interpretation:
+
+- the local calibration suite now has the desired shape
+- three representative real clips pass
+- the obvious bad zoom clip fails cleanly
+- the next benchmark layer should focus on end-to-end process output, not just calibration survival
+
+## Current Medium-Clip Result
+
+Latest 90-second easy-midfield full-process pass from `benchmark-results/local-process/02_easy_midfield_90s_process_stablelane_age36.json`:
+
+- `calibration status`: passed
+- `coverage_ratio`: `0.974`
+- `accepted_anchor_count`: `20`
+- `rejected_anchor_count`: `22`
+- `longest_internal_gap_seconds`: `2.0`
+- `tracks`: `193`
+- `ball`: `644`
+
+Interpretation:
+
+- the short-clip foundation now extends to at least one real medium-length clip
+- the next validation priority is the harder 90-second partial-field clip, not more easy-midfield reruns
+
+## Current Hard 90s Result
+
+Latest 90-second hard partial-field full-process pass from `benchmark-results/local-process/03_hard_partialfield_90s_process_jitter1800.json`:
+
+- `calibration status`: passed
+- `coverage_ratio`: `0.889`
+- `accepted_anchor_count`: `15`
+- `rejected_anchor_count`: `27`
+- `longest_internal_gap_seconds`: `4.37`
+- `tracks`: `180`
+- `ball`: `389`
+
+Interpretation:
+
+- the pipeline now survives a materially harder 90-second partial-field segment
+- the next validation priority is longer duration, starting with the 120-second kickoff clip
 
 ## Current Validation Notes
 
@@ -153,7 +211,7 @@ These are less important right now:
 
 ## Next Actions When Resuming
 
-1. Validate the same build on the kickoff/bootstrap clip.
-2. Validate the same build on the hard partial-field clip.
+1. Finish the local `smoke` full-process benchmark and save one authoritative report.
+2. Promote that to a local `core` full-process benchmark once smoke is stable.
 3. Compare calibration coverage, mapped keyframes, tracks, and ball output across clips.
 4. Only after the broader clip set is healthy, move to improving replay quality rather than calibration survival.

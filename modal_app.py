@@ -445,6 +445,7 @@ def _score_anchor_candidate(
     frame_shape,
     cv2,
     np,
+    allow_rebootstrap=False,
 ):
     projected_mask, visible_ratio = _project_field_mask(candidate_H, field_polylines, frame_shape, cv2, np)
     line_iou = _compute_mask_iou(projected_mask, evidence["line_mask"], np)
@@ -454,12 +455,22 @@ def _score_anchor_candidate(
     )
 
     is_bootstrap = prev_reference_H is None
-    accepted = (
-        is_bootstrap or (
-            visible_ratio >= 0.10 and
-            (temporal_consistency_px is None or temporal_consistency_px <= 1200.0)
-        )
+    standard_anchor_ok = (
+        visible_ratio >= 0.08 and
+        (temporal_consistency_px is None or temporal_consistency_px <= 1200.0)
     )
+    low_visibility_but_stable_ok = (
+        orientation_valid and
+        temporal_consistency_px is not None and
+        temporal_consistency_px <= 300.0 and
+        visible_ratio >= 0.02
+    )
+    rebootstrap_ok = (
+        allow_rebootstrap and
+        orientation_valid and
+        visible_ratio >= 0.10
+    )
+    accepted = is_bootstrap or standard_anchor_ok or low_visibility_but_stable_ok or rebootstrap_ok
 
     line_term = float(np.clip(line_iou / 0.20, 0.0, 1.0))
     visible_term = float(np.clip(visible_ratio / 0.15, 0.0, 1.0))
@@ -863,6 +874,17 @@ def run_calibration_stage(
     cv2,
     np,
 ):
+    import os
+
+    def env_float(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
     # Keep calibration on a full regulation pitch model. The downstream tactical
     # board can still be 9v9, but the camera solve should use the complete field.
     calibration_template = "11v11"
@@ -876,14 +898,20 @@ def run_calibration_stage(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    sample_interval = max(1, int(round(2.0 * fps)))  # 2.0s anchor attempts
+    sample_interval_seconds = env_float("CALIB_SAMPLE_INTERVAL_SECONDS", 2.0)
+    recovery_sample_interval_seconds = env_float("CALIB_RECOVERY_SAMPLE_INTERVAL_SECONDS", 1.0)
+    sample_interval = max(1, int(round(sample_interval_seconds * fps)))
+    recovery_sample_interval = max(1, int(round(recovery_sample_interval_seconds * fps)))
     # PTZ clips can go several seconds with sparse field geometry even when ECC
     # propagation remains stable. Keep the last good anchor alive long enough
     # to bridge those sparse stretches, then rely on hard-fail coverage to
     # reject clips that never recover.
-    max_anchor_age_frames = max(1, int(round(12.0 * fps)))
+    max_anchor_age_seconds = env_float("CALIB_MAX_ANCHOR_AGE_SECONDS", 36.0)
+    max_anchor_age_frames = max(1, int(round(max_anchor_age_seconds * fps)))
     ecc_size = (640, 360)
-    max_propagated_jitter_px = 1200.0
+    max_propagated_jitter_px = env_float("CALIB_MAX_PROPAGATED_JITTER_PX", 1800.0)
+    rebootstrap_after_seconds = env_float("CALIB_REBOOTSTRAP_AFTER_SECONDS", 4.0)
+    log_candidate_scores = os.environ.get("CALIBRATION_LOG_CANDIDATES") == "1"
     scale_to_small = np.array([
         [ecc_size[0] / max(frame_w, 1), 0.0, 0.0],
         [0.0, ecc_size[1] / max(frame_h, 1), 0.0],
@@ -989,7 +1017,13 @@ def run_calibration_stage(
             except np.linalg.LinAlgError:
                 reference_H = None
 
-        if frame_idx % sample_interval == 0:
+        should_attempt_anchor = (frame_idx % sample_interval == 0)
+        if not should_attempt_anchor and anchor_H is not None:
+            anchor_stale = (frame_idx - anchor_frame) >= int(rebootstrap_after_seconds * fps)
+            if anchor_stale and (frame_idx % recovery_sample_interval == 0):
+                should_attempt_anchor = True
+
+        if should_attempt_anchor:
             anchor_attempts += 1
             anchor_start = time.time()
             candidate_Hs, candidate_error = calibrate_frame(frame)
@@ -1007,6 +1041,7 @@ def run_calibration_stage(
                     line_open_kernel=line_open_kernel,
                 )
                 scored_candidates = []
+                allow_rebootstrap = anchor_H is not None and (frame_idx - anchor_frame) >= int(4.0 * fps)
                 for candidate_label, candidate_H in candidate_Hs:
                     score = _score_anchor_candidate(
                         candidate_H,
@@ -1017,6 +1052,7 @@ def run_calibration_stage(
                         frame.shape,
                         cv2,
                         np,
+                        allow_rebootstrap=allow_rebootstrap,
                     )
                     scored_candidates.append((candidate_label, candidate_H, score))
 
@@ -1056,6 +1092,24 @@ def run_calibration_stage(
                     frame_fail_reason[frame_idx] = "anchor_rejected"
                     last_anchor_status = f"rejected:{candidate_label}"
                     last_anchor_error = None
+
+                if log_candidate_scores and (not score["accepted"] or frame_idx >= int(20 * fps)):
+                    candidate_summary = []
+                    for label, _cand_H, cand_score in scored_candidates:
+                        candidate_summary.append({
+                            "label": label,
+                            "accepted": cand_score["accepted"],
+                            "confidence": round(float(cand_score["confidence"]), 3),
+                            "line_iou": round(float(cand_score["line_iou"]), 3),
+                            "visible_ratio": round(float(cand_score["visible_template_ratio"]), 3),
+                            "temporal_px": None if cand_score["temporal_consistency_px"] is None else round(float(cand_score["temporal_consistency_px"]), 2),
+                            "orientation_valid": bool(cand_score["orientation_valid"]),
+                        })
+                    print(
+                        f"[CALIB-CANDIDATES] frame={frame_idx} selected={candidate_label} "
+                        f"selected_status={'accepted' if score['accepted'] else 'rejected'} "
+                        f"candidates={candidate_summary}"
+                    )
             else:
                 anchor_missing += 1
                 frame_fail_reason[frame_idx] = candidate_error or "anchor_missing"
